@@ -3,139 +3,712 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Rovik — savings dashboard</title>
+<meta name="color-scheme" content="dark">
+<title>ROVIK — Local-First Router Dashboard</title>
 <style>
-  :root{
-    --bg:#0b0e14; --card:#121826; --line:#1f2937; --text:#e5e7eb;
-    --dim:#8b98ab; --green:#34d399; --yellow:#fbbf24; --mono:ui-monospace,Menlo,monospace;
+  :root {
+    color-scheme: dark;
+    --bg: #0b0e14;
+    --card: #121826;
+    --card-elev: #161e2f;
+    --grid: rgba(148, 163, 184, 0.06);
+    --line: #263247;
+    --text: #eef2f7;
+    --dim: #9aa7bc;
+    --emerald: #34d399;
+    --emerald-bg: rgba(52, 211, 153, 0.14);
+    --amber: #fbbf24;
+    --amber-bg: rgba(251, 191, 36, 0.14);
+    --danger: #f87171;
+    --danger-bg: rgba(248, 113, 113, 0.14);
+    --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
   }
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,system-ui,sans-serif;padding:24px}
-  h1{font-size:20px;font-weight:600;letter-spacing:.3px}
-  h1 .dot{color:var(--green)}
-  .sub{color:var(--dim);font-size:12.5px;margin-top:2px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-top:20px}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px}
-  .label{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:1px}
-  .big{font:700 34px/1.15 var(--mono);margin-top:6px}
-  .big.green{color:var(--green)}
-  .big.yellow{color:var(--yellow)}
-  .unit{font-size:14px;color:var(--dim);font-weight:400}
-  .row{display:flex;justify-content:space-between;font-size:13px;color:var(--dim);margin-top:8px}
-  .row b{color:var(--text);font-family:var(--mono);font-weight:600}
-  .donut-wrap{display:flex;align-items:center;gap:16px;margin-top:10px}
-  .donut{width:96px;height:96px;border-radius:50%;background:conic-gradient(var(--green) 0deg,#2563eb 0deg);display:flex;align-items:center;justify-content:center}
-  .donut .hole{width:64px;height:64px;border-radius:50%;background:var(--card);display:flex;align-items:center;justify-content:center;font:600 13px var(--mono)}
-  .legend{font-size:12.5px;color:var(--dim)}
-  .legend div{margin:3px 0}
-  .sw{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
-  table{width:100%;border-collapse:collapse;margin-top:10px;font-size:12.5px}
-  th{color:var(--dim);text-align:left;font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.8px;padding:6px 8px;border-bottom:1px solid var(--line)}
-  td{padding:7px 8px;border-bottom:1px solid var(--line);font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:340px}
-  .tag{font-family:var(--mono);font-weight:600}
-  .tag.l{color:var(--green)} .tag.e{color:var(--yellow)}
-  .foot{color:var(--dim);font-size:11.5px;margin-top:16px;font-family:var(--mono)}
-  .pulse{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);margin-right:6px;animation:p 2s infinite}
-  @keyframes p{0%,100%{opacity:1}50%{opacity:.3}}
-  .flash{animation:fl .6s ease-out}
-  @keyframes fl{0%{background:#1d4ed855}100%{background:transparent}}
-  tr.flash td{animation:fl .6s ease-out}
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background-color: var(--bg);
+    background-image:
+      linear-gradient(var(--grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+    background-size: 32px 32px;
+    color: var(--text);
+    font: 15px/1.5 var(--sans);
+    min-height: 100vh;
+    padding: 24px clamp(16px, 3vw, 36px);
+  }
+
+  .shell {
+    max-width: 1120px;
+    margin-inline: auto;
+  }
+
+  .visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--emerald);
+    outline-offset: 2px;
+  }
+
+  header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding-bottom: 18px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+
+  .prism-mark {
+    width: 48px;
+    height: 36px;
+    flex-shrink: 0;
+  }
+
+  .brand-text h1 {
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    line-height: 1.1;
+  }
+
+  .brand-text p {
+    color: var(--dim);
+    font-size: 12.5px;
+    margin-top: 2px;
+  }
+
+  .status-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 5px 11px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    background: var(--card);
+    font: 500 12px/1.2 var(--mono);
+    color: var(--text);
+  }
+
+  .pill[data-state="live"] {
+    border-color: rgba(52, 211, 153, 0.45);
+    background: var(--emerald-bg);
+    color: var(--emerald);
+  }
+
+  .pill[data-state="unreachable"] {
+    border-color: rgba(248, 113, 113, 0.45);
+    background: var(--danger-bg);
+    color: var(--danger);
+  }
+
+  .pill.subtle {
+    color: var(--dim);
+  }
+
+  .pulse-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: currentColor;
+    display: inline-block;
+  }
+
+  .pill[data-state="live"] .pulse-dot {
+    animation: pulse 2s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
+
+  main {
+    margin-top: 22px;
+    display: grid;
+    gap: 18px;
+  }
+
+  .section-heading {
+    color: var(--dim);
+    font-size: 11.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 10px;
+  }
+
+  .kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 14px;
+  }
+
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 18px 20px;
+  }
+
+  .card-label {
+    color: var(--dim);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+  }
+
+  .big {
+    font: 700 34px/1.15 var(--mono);
+    margin-top: 8px;
+  }
+
+  .big.emerald { color: var(--emerald); }
+  .big.amber { color: var(--amber); }
+
+  .metric-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 12px;
+    font-size: 13px;
+    color: var(--dim);
+    margin-top: 8px;
+  }
+
+  .metric-row b {
+    color: var(--text);
+    font-family: var(--mono);
+    font-weight: 600;
+  }
+
+  .donut-wrap {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    margin-top: 12px;
+  }
+
+  .donut {
+    width: 92px;
+    height: 92px;
+    border-radius: 50%;
+    background: conic-gradient(var(--emerald) 0deg, var(--amber) 0deg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .donut .hole {
+    width: 62px;
+    height: 62px;
+    border-radius: 50%;
+    background: var(--card);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font: 600 13px var(--mono);
+  }
+
+  .legend {
+    font-size: 13px;
+    color: var(--dim);
+    display: grid;
+    gap: 4px;
+    flex: 1;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .legend-item b {
+    color: var(--text);
+    font-family: var(--mono);
+  }
+
+  .split-bar {
+    height: 6px;
+    width: 100%;
+    border-radius: 999px;
+    background: var(--amber);
+    overflow: hidden;
+    margin-top: 12px;
+  }
+
+  .split-bar-local {
+    height: 100%;
+    width: 0%;
+    background: var(--emerald);
+    transition: width 0.25s ease;
+  }
+
+  .table-card {
+    padding: 18px 20px;
+  }
+
+  .table-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+
+  .table-header .section-heading {
+    margin-bottom: 0;
+  }
+
+  .table-wrapper {
+    overflow: auto;
+    max-block-size: min(460px, 70vh);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--card);
+    container-type: inline-size;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    font-size: 13px;
+    --label-1: "Time";
+    --label-2: "p_hard";
+    --label-3: "Route";
+    --label-4: "Task";
+  }
+
+  thead {
+    position: sticky;
+    inset-block-start: 0;
+    z-index: 1;
+    background: var(--card-elev);
+  }
+
+  th {
+    color: var(--dim);
+    text-align: left;
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line);
+    white-space: nowrap;
+  }
+
+  td {
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--line);
+    font-family: var(--mono);
+    vertical-align: middle;
+  }
+
+  tbody tr:last-child td {
+    border-bottom: none;
+  }
+
+  td.task-cell {
+    max-width: 460px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-family: var(--sans);
+  }
+
+  .tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font: 600 12px/1.3 var(--mono);
+    white-space: nowrap;
+  }
+
+  .tag.local {
+    background: var(--emerald-bg);
+    color: var(--emerald);
+    border: 1px solid rgba(52, 211, 153, 0.35);
+  }
+
+  .tag.esc {
+    background: var(--amber-bg);
+    color: var(--amber);
+    border: 1px solid rgba(251, 191, 36, 0.35);
+  }
+
+  .empty-row td {
+    color: var(--dim);
+    text-align: center;
+    padding: 20px 12px;
+  }
+
+  .flash {
+    animation: fl 0.6s ease-out;
+  }
+
+  tr.flash td {
+    animation: fl 0.6s ease-out;
+  }
+
+  @keyframes fl {
+    0% { background: rgba(52, 211, 153, 0.16); }
+    100% { background: transparent; }
+  }
+
+  footer {
+    margin-top: 18px;
+    color: var(--dim);
+    font: 11.5px/1.5 var(--mono);
+  }
+
+  @container (width < 600px) {
+    table, thead, tbody, tr, th, td {
+      display: block;
+    }
+
+    thead {
+      display: none;
+    }
+
+    tbody tr {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+    }
+
+    tbody tr:last-child {
+      border-bottom: none;
+    }
+
+    td {
+      border-bottom: none;
+      padding: 4px 0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }
+
+    td.task-cell {
+      max-width: none;
+      white-space: normal;
+      display: block;
+    }
+
+    td:nth-child(1)::before { content: var(--label-1) ": "; color: var(--dim); font-size: 11px; text-transform: uppercase; }
+    td:nth-child(2)::before { content: var(--label-2) ": "; color: var(--dim); font-size: 11px; text-transform: uppercase; }
+    td:nth-child(3)::before { content: var(--label-3) ": "; color: var(--dim); font-size: 11px; text-transform: uppercase; }
+    td:nth-child(4)::before { content: var(--label-4) ": "; color: var(--dim); font-size: 11px; text-transform: uppercase; display: block; margin-bottom: 2px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .pill[data-state="live"] .pulse-dot,
+    .flash,
+    tr.flash td {
+      animation: none;
+    }
+    .split-bar-local {
+      transition: none;
+    }
+  }
+
+  @media (forced-colors: active) {
+    body {
+      background-image: none;
+    }
+    .card,
+    .pill,
+    .tag,
+    .table-wrapper,
+    .split-bar,
+    .donut {
+      border: 1px solid CanvasText;
+      forced-color-adjust: auto;
+    }
+    .split-bar-local {
+      background: Highlight;
+    }
+  }
 </style>
 </head>
 <body>
-  <h1><span class="dot">🟢</span> Rovik <span style="color:var(--dim);font-weight:400">/ savings dashboard</span></h1>
-  <div class="sub"><span class="pulse"></span>live · polls every 2s · <span id="updated">—</span></div>
-
-  <div class="grid">
-    <div class="card">
-      <div class="label">Estimated savings</div>
-      <div class="big green">$<span id="savings">0.00</span></div>
-      <div class="row"><span>local tokens answered free</span><b id="ltok">0</b></div>
-      <div class="row"><span>vs frontier @ $<span id="price">3</span>/M tok</span><b id="basis">—</b></div>
-    </div>
-    <div class="card">
-      <div class="label">Route mix</div>
-      <div class="donut-wrap">
-        <div class="donut" id="donut"><div class="hole"><span id="pct">0%</span></div></div>
-        <div class="legend">
-          <div><span class="sw" style="background:var(--green)"></span>local · <b id="nloc">0</b></div>
-          <div><span class="sw" style="background:#2563eb"></span>escalated · <b id="nesc">0</b></div>
-          <div style="margin-top:6px">total decisions <b id="ntot">0</b></div>
-        </div>
+<div class="shell">
+  <header>
+    <div class="brand">
+      <svg class="prism-mark" viewBox="0 0 64 44" aria-hidden="true">
+        <line x1="2" y1="22" x2="22" y2="22" stroke="#eef2f7" stroke-width="2.5" stroke-linecap="round"/>
+        <polygon points="32,4 16,38 48,38" fill="#161e2f" stroke="#9aa7bc" stroke-width="2"/>
+        <line x1="39" y1="20" x2="62" y2="14" stroke="#34d399" stroke-width="4" stroke-linecap="round"/>
+        <line x1="41" y1="25" x2="62" y2="34" stroke="#fbbf24" stroke-width="2.2" stroke-linecap="round"/>
+      </svg>
+      <div class="brand-text">
+        <h1>ROVIK</h1>
+        <p>Local-first AI model routing switch</p>
       </div>
     </div>
-    <div class="card">
-      <div class="label">Frontier spend (actually paid)</div>
-      <div class="big yellow">$<span id="spend">0.00</span></div>
-      <div class="row"><span>escalated tokens</span><b id="etok">0</b></div>
-      <div class="row"><span>kept on the big model</span><b id="pesc">0%</b></div>
+
+    <div class="status-bar">
+      <span id="conn-badge" class="pill" data-state="connecting">
+        <span class="pulse-dot" aria-hidden="true"></span>
+        <span id="conn-text">Connecting</span>
+      </span>
+      <span id="failsafe-pill" class="pill subtle">
+        <span aria-hidden="true">🛡</span>
+        <span id="failsafe-text">Fail-safe: …</span>
+      </span>
+      <span class="pill subtle">
+        <span>Updated</span>
+        <span id="updated">—</span>
+      </span>
+      <span id="conn-announcer" class="visually-hidden" role="status" aria-live="polite"></span>
     </div>
-  </div>
+  </header>
 
-  <div class="card" style="margin-top:14px">
-    <div class="label">Recent decisions</div>
-    <table>
-      <thead><tr><th>time</th><th>p_hard</th><th>route</th><th>task</th></tr></thead>
-      <tbody id="rows"><tr><td colspan="4" style="color:var(--dim)">waiting for decisions…</td></tr></tbody>
-    </table>
-  </div>
+  <main>
+    <section aria-labelledby="metrics-heading">
+      <h2 id="metrics-heading" class="section-heading">Routing Metrics</h2>
+      <div class="kpi-grid">
+        <div class="card">
+          <div class="card-label">Estimated savings</div>
+          <div class="big emerald">$<span id="savings">0.00</span></div>
+          <div class="metric-row"><span>Local tokens answered free</span><b id="ltok">0</b></div>
+          <div class="metric-row"><span>vs. frontier @ $<span id="price">3</span>/M tok</span><b id="basis">Captured usage</b></div>
+        </div>
 
-  <div class="foot" id="foot">savings = tokens answered locally × frontier price (ROVIK_FRONTIER_PRICE_PER_MTOK). estimate basis: usage captured from upstream responses.</div>
+        <div class="card">
+          <div class="card-label">Route mix</div>
+          <div class="donut-wrap">
+            <div class="donut" id="donut" aria-hidden="true"><div class="hole"><span id="pct">0%</span></div></div>
+            <div class="legend">
+              <div class="legend-item"><span><span aria-hidden="true">🟢</span> Local</span><b id="nloc">0</b></div>
+              <div class="legend-item"><span><span aria-hidden="true">⚡</span> Escalated</span><b id="nesc">0</b></div>
+              <div class="legend-item"><span>Total decisions</span><b id="ntot">0</b></div>
+            </div>
+          </div>
+          <div class="split-bar" aria-hidden="true"><div id="split-local" class="split-bar-local"></div></div>
+        </div>
+
+        <div class="card">
+          <div class="card-label">Frontier spend (estimated)</div>
+          <div class="big amber">$<span id="spend">0.00</span></div>
+          <div class="metric-row"><span>Escalated tokens</span><b id="etok">0</b></div>
+          <div class="metric-row"><span>Kept on frontier</span><b id="pesc">0%</b></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card table-card" aria-labelledby="decisions-heading">
+      <div class="table-header">
+        <h2 id="decisions-heading" class="section-heading">Recent Decisions</h2>
+      </div>
+      <div tabindex="0" role="region" aria-labelledby="decisions-caption" class="table-wrapper">
+        <table>
+          <caption id="decisions-caption" class="visually-hidden">Recent routing decisions</caption>
+          <thead>
+            <tr>
+              <th scope="col">Time</th>
+              <th scope="col">p_hard</th>
+              <th scope="col">Route</th>
+              <th scope="col">Task</th>
+            </tr>
+          </thead>
+          <tbody id="rows">
+            <tr class="empty-row"><td colspan="4">Waiting for routing decisions…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer id="foot">
+    savings = tokens answered locally × frontier price (ROVIK_FRONTIER_PRICE_PER_MTOK). estimate basis: usage captured from upstream responses.
+  </footer>
+</div>
 
 <script>
-const $=id=>document.getElementById(id);
-const fmt=n=>n.toLocaleString();
-const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const flash=id=>{const e=$(id);e.classList.remove('flash');void e.offsetWidth;e.classList.add('flash');};
-let prev={};
+const $ = (id) => document.getElementById(id);
+const fmt = (n) => Number(n).toLocaleString();
+const prev = {};
+let lastConnState = "connecting";
+let tickCount = 0;
 
-function setIf(id,val,fmtFn){
-  const e=$(id);
-  const key=id+'|'+val;
-  if(prev[id]!==key){ prev[id]=key; e.textContent=fmtFn(val); flash(id); }
+function setIf(id, val, fmtFn) {
+  const el = $(id);
+  const key = id + "|" + val;
+  if (prev[id] !== key) {
+    prev[id] = key;
+    el.textContent = fmtFn(val);
+    el.classList.remove("flash");
+    void el.offsetWidth;
+    el.classList.add("flash");
+  }
 }
 
-async function tick(){
-  try{
-    const r=await fetch('/stats'); const s=await r.json();
-    setIf('savings',(s.savings_usd_est??0).toFixed(2),v=>v);
-    setIf('spend',((s.escalated_tokens??0)/1e6*(s.price_per_mtok_assumed??3)).toFixed(2),v=>v);
-    setIf('ltok',fmt(s.local_tokens??0),v=>v);
-    setIf('etok',fmt(s.escalated_tokens??0),v=>v);
-    setIf('price',s.price_per_mtok_assumed??3,v=>v);
-    setIf('nloc',s.local_count??0,v=>v);
-    setIf('nesc',s.escalated_count??0,v=>v);
-    setIf('ntot',s.decisions_total??0,v=>v);
-    const tot=Math.max(1,(s.local_count??0)+(s.escalated_count??0));
-    const lp=(s.local_count??0)/tot;
-    setIf('pct',Math.round(lp*100),v=>v+'%');
-    setIf('pesc',Math.round((s.escalated_count??0)/tot*100),v=>v+'%');
-    $('donut').style.background=`conic-gradient(var(--green) ${lp*360}deg,#2563eb ${lp*360}deg)`;
-    const seen=new Set();
-    const rows=(s.recent??[]).slice().reverse().filter(r=>{
-      const k=(r.task||'')+'|'+r.decision;           // dedupe re-judged dupes
-      if(seen.has(k))return false; seen.add(k); return true;
-    }).map(r=>{
-      const local=['local','local-harness'].includes(r.decision);
-      const d=local?'<span class="tag l">🟢 local</span>':'<span class="tag e">⚡ escalated</span>';
-      let t=(r.task||'').replace(/^\[Workspace[^\]]*\]\s*/,'');
-      if(t.length>60){t=t.slice(0,60);t=t.slice(0,Math.max(t.lastIndexOf(' '),0))+'…';} // word boundary
-      if(!t)t='(tool payload)';
-      return `<tr><td>${esc((r.ts||'').slice(11,19))}</td><td>${r.p_hard!=null?r.p_hard.toFixed(2):'—'}</td><td>${d}</td><td title="${esc(r.task)}">${esc(t)}</td></tr>`;
-    }).join('');
-    if(rows){
-      const htmlTarget=$('rows');
-      if(htmlTarget.dataset.sig!==undefined&&htmlTarget.dataset.sig!==rows.slice(0,300)){
-        htmlTarget.innerHTML=rows.replace('<tr>','<tr class="flash">',1); // flash newest
-      }else if(htmlTarget.dataset.sig===undefined){
-        htmlTarget.innerHTML=rows;
-      }
-      htmlTarget.dataset.sig=rows.slice(0,300);
+function setConnection(state, label, announce) {
+  const badge = $("conn-badge");
+  badge.dataset.state = state;
+  $("conn-text").textContent = label;
+  if (state !== lastConnState) {
+    lastConnState = state;
+    if (announce) {
+      $("conn-announcer").textContent = announce;
     }
-    $('updated').textContent=new Date().toLocaleTimeString();
-  }catch(e){$('updated').textContent='proxy unreachable — retrying';}
+  }
 }
-tick(); setInterval(tick,2000);
+
+function buildRouteTag(isLocal) {
+  const span = document.createElement("span");
+  span.className = isLocal ? "tag local" : "tag esc";
+  const icon = document.createElement("span");
+  icon.setAttribute("aria-hidden", "true");
+  icon.textContent = isLocal ? "🟢" : "⚡";
+  span.appendChild(icon);
+  span.appendChild(document.createTextNode(isLocal ? " Local" : " Escalated"));
+  return span;
+}
+
+function renderRows(recent) {
+  const seen = new Set();
+  const deduped = (recent || []).slice().reverse().filter((r) => {
+    const k = (r.task || "") + "|" + r.decision;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+
+  if (!deduped.length) return;
+
+  const sig = deduped.map((r) => `${r.ts}|${r.decision}|${r.task || ""}`).join("||").slice(0, 400);
+  const tbody = $("rows");
+  if (tbody.dataset.sig === sig) return;
+
+  const isUpdate = tbody.dataset.sig !== undefined;
+  tbody.dataset.sig = sig;
+
+  const frag = document.createDocumentFragment();
+  deduped.forEach((r, idx) => {
+    const tr = document.createElement("tr");
+    if (isUpdate && idx === 0) tr.className = "flash";
+
+    const tdTime = document.createElement("td");
+    tdTime.textContent = (r.ts || "").slice(11, 19) || "—";
+
+    const tdProb = document.createElement("td");
+    tdProb.textContent = r.p_hard != null ? Number(r.p_hard).toFixed(2) : "—";
+
+    const tdRoute = document.createElement("td");
+    const isLocal = ["local", "local-harness"].includes(r.decision);
+    tdRoute.appendChild(buildRouteTag(isLocal));
+
+    const tdTask = document.createElement("td");
+    tdTask.className = "task-cell";
+    let taskText = String(r.task || "").replace(/^\[Workspace[^\]]*\]\s*/, "");
+    if (taskText.length > 68) {
+      const cut = taskText.slice(0, 68);
+      const sp = cut.lastIndexOf(" ");
+      taskText = (sp > 20 ? cut.slice(0, sp) : cut) + "…";
+    }
+    if (!taskText) taskText = "(tool payload)";
+    tdTask.textContent = taskText;
+    if (r.task) tdTask.title = String(r.task);
+
+    tr.appendChild(tdTime);
+    tr.appendChild(tdProb);
+    tr.appendChild(tdRoute);
+    tr.appendChild(tdTask);
+    frag.appendChild(tr);
+  });
+
+  tbody.replaceChildren(frag);
+}
+
+async function refreshHealth() {
+  try {
+    const res = await fetch("/health");
+    if (!res.ok) return;
+    const h = await res.json();
+    const fb = h.fallback_route || "local";
+    $("failsafe-text").textContent = "Fail-safe: " + fb;
+  } catch (_err) {
+    // Health retry handled via stats tick.
+  }
+}
+
+async function tick() {
+  try {
+    const r = await fetch("/stats");
+    if (!r.ok) throw new Error("bad status");
+    const s = await r.json();
+
+    const wasUnreachable = lastConnState !== "live";
+    setConnection("live", "Live", "Rovik proxy connected");
+    if (wasUnreachable || tickCount % 5 === 0) {
+      refreshHealth();
+    }
+
+    setIf("savings", (s.savings_usd_est ?? 0).toFixed(2), (v) => v);
+    setIf("spend", ((s.escalated_tokens ?? 0) / 1e6 * (s.price_per_mtok_assumed ?? 3)).toFixed(2), (v) => v);
+    setIf("ltok", fmt(s.local_tokens ?? 0), (v) => v);
+    setIf("etok", fmt(s.escalated_tokens ?? 0), (v) => v);
+    setIf("price", s.price_per_mtok_assumed ?? 3, (v) => v);
+    setIf("nloc", s.local_count ?? 0, (v) => v);
+    setIf("nesc", s.escalated_count ?? 0, (v) => v);
+    setIf("ntot", s.decisions_total ?? 0, (v) => v);
+
+    const tot = Math.max(1, (s.local_count ?? 0) + (s.escalated_count ?? 0));
+    const lp = (s.local_count ?? 0) / tot;
+    const lpPct = Math.round(lp * 100);
+    setIf("pct", lpPct, (v) => v + "%");
+    setIf("pesc", Math.round(((s.escalated_count ?? 0) / tot) * 100), (v) => v + "%");
+
+    $("donut").style.background = `conic-gradient(var(--emerald) ${lp * 360}deg, var(--amber) ${lp * 360}deg)`;
+    $("split-local").style.width = `${lpPct}%`;
+
+    renderRows(s.recent);
+    $("updated").textContent = new Date().toLocaleTimeString();
+  } catch (_err) {
+    setConnection("unreachable", "Reconnecting", "Proxy unreachable, retrying");
+    $("updated").textContent = "retrying";
+  } finally {
+    tickCount += 1;
+  }
+}
+
+refreshHealth();
+tick();
+setInterval(tick, 2000);
 </script>
 </body>
 </html>

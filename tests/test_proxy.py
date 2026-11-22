@@ -44,6 +44,12 @@ def _install_fastapi_stub():
         def __init__(self, content=None, status_code=200, **kwargs):
             self.content = content
             self.status_code = status_code
+            if isinstance(content, str):
+                self.body = content.encode("utf-8")
+            elif isinstance(content, (bytes, bytearray)):
+                self.body = bytes(content)
+            else:
+                self.body = b""
 
     class _JSONResponse(_Response):
         def __init__(self, content=None, status_code=200, **kwargs):
@@ -227,6 +233,23 @@ class TestLogPaths(unittest.TestCase):
                     self.assertEqual(reloaded.LOG_FILE, os.path.join(tmpdir, "proxy_log.jsonl"))
         finally:
             importlib.reload(proxy)
+
+
+class TestEndpoints(unittest.TestCase):
+    def test_health_and_dashboard_html(self):
+        health = proxy.health()
+        self.assertTrue(health["ok"])
+        self.assertEqual(health["proxy"], "rovik")
+        self.assertIn("fallback_route", health)
+
+        resp = proxy.dashboard()
+        self.assertEqual(resp.status_code, 200)
+        html = resp.body.decode("utf-8") if isinstance(getattr(resp, "body", None), (bytes, bytearray)) else resp.content
+        self.assertIn("ROVIK", html)
+        self.assertIn('<meta name="color-scheme"', html)
+        self.assertIn('role="region"', html)
+        self.assertIn("@container", html)
+        self.assertIn("forced-colors", html)
 
 
 if __name__ == "__main__":
