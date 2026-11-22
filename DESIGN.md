@@ -126,7 +126,7 @@ The isolation boundary is explicit and load-bearing:
 - **Local-First:** Requests handled locally never leave the host machine. The classifier sidecar, the local model tier, and the decision/shadow logs all run on loopback, on your hardware.
 - **Egress Boundary:** Upstream/frontier endpoints are only contacted when a task is *explicitly escalated* by the routing layer (or when a local tier fails and falls back to escalation). No telemetry, no background requests, nothing leaves the host otherwise.
 - **Secret Isolation:** Upstream API keys are held strictly by the egress runner (`serving/proxy.py`, reading `os.environ` first and falling back to `ROVIK_ENV_FILE`). They are never exposed to — and never required by — the local Laya classifier sidecar.
-- **Harness Agnostic:** Rovik exposes a standard OpenAI-compatible `/v1/chat/completions` endpoint. Any OpenAI-compatible framework, custom agent loop, or harness can point its `base_url` at it.
+- **Harness Agnostic (`/v1/chat/completions`):** Rovik exposes OpenAI Chat Completions (`POST /v1/chat/completions` + `GET /v1/models`) and is compatible with `/v1/chat/completions` clients/harnesses (including streaming SSE and tool-carrying payloads). The same routing architecture has run daily behind a local-first Hermes agent profile; this repo is its cleaned-up continuation, verified end-to-end from a clean clone but not yet soak-tested on live traffic. Harnesses speaking Anthropic Messages (`POST /v1/messages`, Claude Code) or OpenAI Responses (`POST /v1/responses`, current Codex CLI) are not yet implemented natively (see [§5](#5-status-open-problems--troubleshooting)).
 
 ### 4.1 The router (`serving/proxy.py`) — and how to see who answered
 
@@ -182,6 +182,12 @@ The joiner ([serving/outcome_joiner.py](serving/outcome_joiner.py)) is byte-offs
 - **Cold starts & MLX memory hygiene:** Initial sidecar startup loads the checkpoint into unified memory; warmup runs automatically during FastAPI lifespan startup. Under varied-length traffic, MLX's Metal allocator pool can fragment (~43 GB cache growth over 100 varied requests measured in [eval/sidecar_memory_audit.md](eval/sidecar_memory_audit.md)); `serving/sidecar.py` clears the Metal cache every `LAYA_CLEAR_CACHE_EVERY` requests (default `10`).
 - **Concurrency:** Tuned for single-user local agent loops (requests serialized in the sidecar via `threading.Lock`).
 - **Fail-safe behavior:** Judge failures route according to `ROVIK_FALLBACK_ROUTE` (default `local`, or `escalate`). A broken judge costs speed on `local`, never accidental cloud spend.
+
+### Known harness gaps & code backlog
+
+- **Missing `/v1/messages` and `/v1/responses` routes:** [serving/proxy.py](serving/proxy.py) currently exposes `POST /v1/chat/completions`, `GET /v1/models`, `GET /health`, `GET /stats`, and `GET /` only. Claude Code (`POST /v1/messages`) and current Codex CLI (`POST /v1/responses`, since `wire_api = "chat"` was removed) require an external protocol adapter until those routes are added.
+- **Non-streaming tool-call null content tagging:** In [serving/proxy.py](serving/proxy.py), streaming SSE only prepends `tag` when `delta.content` is non-empty, whereas the non-streaming paths (`local` and `esc`) still inject `f"{tag}\n"` even when `message.content` is `null` or `""` on a pure tool-call response.
+- **Dual `system` message prepend on decision ID injection:** `_thread_decision_id()` inserts a second `{"role": "system", ...}` message at index `0`, which strict upstream chat templates that allow only one leading `system` message can reject (`400`); merging into an existing leading system message (or gating injection behind a config flag) is tracked for a future code pass.
 
 ---
 

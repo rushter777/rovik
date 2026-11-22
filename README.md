@@ -6,7 +6,7 @@
 
 Rovik puts an OpenAI-compatible routing switch in front of your AI apps or agent harness. A tiny ~400M classifier (**Laya**) reads each prompt on your own hardware in ~40ms, routes routine work to your local LLM, and passes genuinely demanding work to your chosen frontier model.
 
-> **Status:** Experimental (`v0.2`). Tested on single-turn completions, streaming SSE, and OpenAI-compatible chat/tool payloads on Apple Silicon (macOS).
+> **Status:** Experimental (`v0.2`) on Apple Silicon (macOS). The same routing architecture has run daily behind a local-first Hermes agent profile on single-turn completions, streaming SSE, and tool-carrying OpenAI Chat Completions payloads (`/v1/chat/completions` — simple tool calls stay local; hard multi-step chains escalate); this repo is its cleaned-up continuation, verified end-to-end from a clean clone but not yet soak-tested on live traffic. Harnesses speaking Anthropic Messages (`/v1/messages`, e.g. Claude Code) or OpenAI Responses (`/v1/responses`, e.g. current Codex CLI) are not natively supported yet (see [§2](#2-run-it-in-your-agent) & [DESIGN.md §5](DESIGN.md#5-status-open-problems--troubleshooting)).
 > **Looking for the methodology, benchmarks, and why Rovik works this way?** Read [DESIGN.md](DESIGN.md).
 
 ```text
@@ -30,11 +30,12 @@ Rovik puts an OpenAI-compatible routing switch in front of your AI apps or agent
 
 - [The Three Model Roles](#the-three-model-roles)
 - [1. Quick Start (5 minutes)](#1-quick-start-5-minutes)
-- [2. Bring Your Own Data (Training on Your Prompts)](#2-bring-your-own-data-training-on-your-prompts)
-- [3. Reference Local Model Setups](#3-reference-local-model-setups)
-- [4. Configuration, Privacy & Fail-Safe](#4-configuration-privacy--fail-safe)
-- [5. Results & Design Deep-Dive](#5-results--design-deep-dive)
-- [6. CLI Reference, Project Layout & Tests](#6-cli-reference-project-layout--tests)
+- [2. Run It in Your Agent](#2-run-it-in-your-agent)
+- [3. Bring Your Own Data (Training on Your Prompts)](#3-bring-your-own-data-training-on-your-prompts)
+- [4. Reference Local Model Setups](#4-reference-local-model-setups)
+- [5. Configuration, Privacy & Fail-Safe](#5-configuration-privacy--fail-safe)
+- [6. Results & Design Deep-Dive](#6-results--design-deep-dive)
+- [7. CLI Reference, Project Layout & Tests](#7-cli-reference-project-layout--tests)
 
 ---
 
@@ -112,11 +113,102 @@ rovik judge "Find why the CI tests keep failing and fix the root cause"
 open http://127.0.0.1:8788/
 ```
 
-Point any OpenAI-compatible client, SDK, or agent harness at `http://127.0.0.1:8788/v1`.
+Point any OpenAI Chat Completions (`/v1/chat/completions`) client or agent harness at `http://127.0.0.1:8788/v1` — see [§2 Run It in Your Agent](#2-run-it-in-your-agent) for concrete configs.
 
 ---
 
-## 2. Bring Your Own Data (Training on Your Prompts)
+## 2. Run It in Your Agent
+
+Rovik exposes `POST /v1/chat/completions` and `GET /v1/models` on `http://127.0.0.1:8788/v1` (supporting streaming SSE and tool-carrying payloads: simple tool calls stay local; hard multi-step chains escalate).
+
+### Generic recipe (`/v1/chat/completions`)
+
+- **`base_url`:** `http://127.0.0.1:8788/v1`
+- **`model`:** Any placeholder string (for example `rovik-proxy` or your local model's name) — the proxy overwrites the incoming `model` field per tier with `ROVIK_LOCAL_MODEL` or `ROVIK_ESC_MODEL`.
+- **`api_key`:** Any dummy string (for example `no-key-needed`) — the proxy is loopback-only; the frontier key (`ROVIK_ESC_KEYNAME`, default `OPENROUTER_API_KEY`) is read by the proxy process from its own environment or `ROVIK_ENV_FILE`, never from the client.
+
+> **Verification scope:** The same routing architecture has run daily behind a local-first Hermes agent profile; this repo is its cleaned-up continuation, verified end-to-end from a clean clone (including generic OpenAI SDK calls) but not yet soak-tested on live traffic. The OpenCode, Aider, and Continue examples below follow each tool's documented `/v1/chat/completions` configuration syntax.
+
+### Hermes
+
+The same routing architecture has run daily behind a local-first Hermes agent profile; the model block below is the profile configuration used with it and works for any Hermes profile pointing at this proxy:
+
+```yaml
+# ~/.hermes/profiles/<your-agent-profile>/config.yaml
+model:
+  default: Qwen3.6-35B-A3B-UD-Q4_K_XL   # any placeholder — proxy overwrites with ROVIK_LOCAL_MODEL / ROVIK_ESC_MODEL
+  provider: custom
+  base_url: http://127.0.0.1:8788/v1     # the Rovik proxy
+  api_key: no-key-needed                 # loopback, no auth on the proxy
+  context_length: 65536
+  request_timeout_seconds: 300
+```
+
+- **Model name is a placeholder by design:** The proxy replaces `model` per tier before forwarding upstream, so clients can send `rovik-proxy`, a local model name, or anything else.
+- **No API key at the proxy:** Loopback-only with no client auth; your frontier key stays isolated in the proxy's environment / `ROVIK_ENV_FILE`.
+- **Streaming works end-to-end:** Streaming SSE chunks pass through directly, with the route tag prepended to the first content-bearing chunk.
+
+### OpenCode (`~/.config/opencode/opencode.json` or project `opencode.json`)
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "rovik": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Rovik Router",
+      "options": {
+        "baseURL": "http://127.0.0.1:8788/v1",
+        "apiKey": "no-key-needed"
+      },
+      "models": {
+        "rovik-proxy": {
+          "name": "Rovik Router"
+        }
+      }
+    }
+  },
+  "model": "rovik/rovik-proxy"
+}
+```
+
+### Aider
+
+```bash
+export OPENAI_API_BASE="http://127.0.0.1:8788/v1"
+export OPENAI_API_KEY="no-key-needed"
+aider --model openai/rovik-proxy
+```
+
+### Continue (`~/.continue/config.yaml`)
+
+```yaml
+name: Rovik Local Router
+version: 1.0.0
+schema: v1
+
+models:
+  - name: Rovik Router
+    provider: openai
+    model: rovik-proxy
+    apiBase: http://127.0.0.1:8788/v1
+    apiKey: no-key-needed
+    roles:
+      - chat
+      - edit
+      - apply
+```
+
+### Harnesses Not Supported Natively Yet (Protocol Gaps)
+
+- **Claude Code (`/v1/messages`):** Speaks Anthropic Messages (`ANTHROPIC_BASE_URL` → `/v1/messages`) exclusively. Needs an Anthropic→OpenAI translation adapter (such as LiteLLM or `claude-code-proxy`) in front of Rovik, or a `/v1/messages` route in Rovik.
+- **Codex CLI (`/v1/responses`):** Current Codex CLI removed `wire_api = "chat"` and requires the OpenAI Responses API (`wire_api = "responses"` → `/v1/responses`). Needs a Responses→Chat-Completions adapter, or a `/v1/responses` route in Rovik.
+
+See [DESIGN.md §5](DESIGN.md#5-status-open-problems--troubleshooting) for tracked protocol gaps and harness edge cases.
+
+---
+
+## 3. Bring Your Own Data (Training on Your Prompts)
 
 Rovik's core finding is that generic classifier leaderboards don't transfer to your tasks—fine-tuning Laya on **your own prompts** is where the accuracy comes from.
 
@@ -167,7 +259,7 @@ Rovik's core finding is that generic classifier leaderboards don't transfer to y
 
 ---
 
-## 3. Reference Local Model Setups
+## 4. Reference Local Model Setups
 
 ### Apple Silicon Reference (`llama.cpp` + Qwen3.6-35B-A3B)
 
@@ -201,7 +293,7 @@ Point `ROVIK_LOCAL_URL` (via `rovik init` or `rovik.env`) at any OpenAI-compatib
 
 ---
 
-## 4. Configuration, Privacy & Fail-Safe
+## 5. Configuration, Privacy & Fail-Safe
 
 Settings are read in order: **process environment → `rovik.env` (or `--config` / `ROVIK_CONFIG`) → defaults**. See [rovik.env.example](rovik.env.example) for the complete template.
 
@@ -228,7 +320,7 @@ Settings are read in order: **process environment → `rovik.env` (or `--config`
 
 ---
 
-## 5. Results & Design Deep-Dive
+## 6. Results & Design Deep-Dive
 
 On ~1,500 real assistant tasks, fine-tuned Laya achieved **79.6%–85.5%** accuracy on the tool gates (`tools_file`, `tools_terminal`, `tools_web`) and **81.2% precision** at 6.3% coverage on the `P(hard) >= 0.8` escalation flag (3.7× the 22% base rate), running in ~40ms on Apple Silicon.
 
@@ -236,7 +328,7 @@ For the full research story — including why subjective difficulty labels faile
 
 ---
 
-## 6. CLI Reference, Project Layout & Tests
+## 7. CLI Reference, Project Layout & Tests
 
 | Command | What it does |
 |---|---|
