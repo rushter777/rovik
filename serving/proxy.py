@@ -4,33 +4,44 @@
 OpenAI-compatible /v1/chat/completions endpoint that routes per request:
 
     request comes in
-      ├─ has tools / tool calls / tool results → PASS-THROUGH to the session
-      │   model (GLM 5.3 via OpenRouter), unchanged — harness work, no judgment
-      └─ pure chat → judge with Laya (sidecar :8777)
-            ├─ difficulty flag (p_hard >= 0.8) → ESCALATE to session model
-            └─ routine → LOCAL: the 35B MoE answers (llama-server :8081), free
+      └─ judge latest user task with Laya (sidecar :8777)
+            ├─ difficulty flag (p_hard >= 0.8) → ESCALATE / passthrough-harness
+            │   to the session model (GLM 5.3 via OpenRouter)
+            └─ routine (including simple tool calls) → LOCAL / local-harness:
+                the 35B MoE answers (llama-server :8081), free
 
 Every answer is tagged so the human always knows who answered:
     [🟢 LOCAL · 35B-A3B]   or   [⚡ ESCALATED · GLM 5.3]
-Every decision is logged to data/proxy_log.jsonl.
+Every decision is logged to data/proxy_log.jsonl (ROVIK_LOG_DIR to override).
 
-Fail-safe: ANY error anywhere → pass through to the session model. The proxy
-must never be the reason a chat breaks.
+Fail-safe: judge failures follow ROVIK_FALLBACK_ROUTE (default 'local', or
+'escalate'). Local upstream failures fall back to escalation.
 
 Env:
-    ROVIK_PROXY_PORT   (default 8788)
-    ROVIK_LOCAL_URL    (default http://127.0.0.1:8081/v1/chat/completions)
-    ROVIK_JUDGE_URL    (default http://127.0.0.1:8777/predict)
-    ROVIK_ESC_URL      (default https://openrouter.ai/api/v1/chat/completions)
-    ROVIK_ESC_MODEL    (default z-ai/glm-5.3 — swap frontier providers without code changes)
-    ROVIK_ESC_KEYNAME   (default OPENROUTER_API_KEY — name of env var holding the key)
-    ROVIK_PROXY_HOST / ROVIK_PROXY_PORT  (default 127.0.0.1:8788)
-    LAYA_THRESH_HARD     (default 0.8)
+    ROVIK_PROXY_HOST            (default 127.0.0.1)
+    ROVIK_PROXY_PORT            (default 8788)
+    ROVIK_LOCAL_URL             (default http://127.0.0.1:8081/v1/chat/completions)
+    ROVIK_LOCAL_MODEL           (default local-35b)
+    ROVIK_JUDGE_URL             (default http://127.0.0.1:8777/predict; falls back to LAYA_SIDECAR_URL)
+    ROVIK_ESC_URL               (default https://openrouter.ai/api/v1/chat/completions)
+    ROVIK_ESC_MODEL             (default z-ai/glm-5.3 — swap frontier providers without code changes)
+    ROVIK_ESC_KEYNAME           (default OPENROUTER_API_KEY — env var holding the key)
+    ROVIK_ENV_FILE              (default ~/.hermes/.env — fallback env file if key not in os.environ)
+    ROVIK_FALLBACK_ROUTE        (default local — 'local' or 'escalate' when judge fails)
+    ROVIK_LOG_DIR               (default <repo>/data)
+    ROVIK_TAG_LOCAL             (default '[🟢 LOCAL · 35B-A3B]')
+    ROVIK_TAG_ESC               (default '[⚡ ESCALATED · GLM 5.3]')
+    ROVIK_FRONTIER_PRICE_PER_MTOK (default 3.0)
+    LAYA_THRESH_HARD            (default 0.8)
 """
 
+from __future__ import annotations
+
+import copy
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -39,22 +50,36 @@ import urllib.request
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import laya_hook  # the proven judge client: extractors + fail-safe, tested 14/14
+try:
+    from serving import hook as laya_hook
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import hook as laya_hook
 
 PROXY_PORT = int(os.environ.get("ROVIK_PROXY_PORT", "8788"))
 PROXY_HOST = os.environ.get("ROVIK_PROXY_HOST", "127.0.0.1")
 LOCAL_URL = os.environ.get("ROVIK_LOCAL_URL", "http://127.0.0.1:8081/v1/chat/completions")
-JUDGE_URL = os.environ.get("ROVIK_JUDGE_URL", "http://127.0.0.1:8777/predict")
+LOCAL_MODEL = os.environ.get("ROVIK_LOCAL_MODEL", "local-35b")
+JUDGE_URL = os.environ.get("ROVIK_JUDGE_URL") or os.environ.get(
+    "LAYA_SIDECAR_URL", "http://127.0.0.1:8777/predict"
+)
 ESC_KEYNAME = os.environ.get("ROVIK_ESC_KEYNAME", "OPENROUTER_API_KEY")
+ENV_FILE = os.environ.get("ROVIK_ENV_FILE", "~/.hermes/.env")
 # Frontier endpoint — swap providers without touching code (OpenRouter by default).
 ESC_URL = os.environ.get(
     "ROVIK_ESC_URL", "https://openrouter.ai/api/v1/chat/completions"
 )
 THRESH = float(os.environ.get("LAYA_THRESH_HARD", "0.8"))
+FALLBACK_ROUTE = os.environ.get(
+    "ROVIK_FALLBACK_ROUTE", os.environ.get("FALLBACK_ROUTE", "local")
+).strip().lower()
+if FALLBACK_ROUTE not in ("local", "escalate"):
+    FALLBACK_ROUTE = "local"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-LOG_FILE = os.path.join(HERE, "data", "proxy_log.jsonl")
+REPO_ROOT = os.path.dirname(HERE)
+LOG_DIR = os.environ.get("ROVIK_LOG_DIR", os.path.join(REPO_ROOT, "data"))
+LOG_FILE = os.path.join(LOG_DIR, "proxy_log.jsonl")
 # Tags are user-facing receipts, fully configurable. Defaults describe THIS
 # machine's stack; override per deployment (icons-only works too, e.g.
 # ROVIK_TAG_LOCAL="🟢"). History-stripping recognizes any bracketed
@@ -66,14 +91,27 @@ app = FastAPI()
 
 
 def _esc_headers():
-    """Escalation key read from Hermes's own .env at runtime. Never printed."""
+    """Read ESC_KEYNAME from os.environ first, falling back to ROVIK_ENV_FILE (default ~/.hermes/.env). Never printed."""
     headers = {"Content-Type": "application/json"}
-    env_path = os.path.expanduser("~/.hermes/.env")
-    if os.path.exists(env_path):
-        for line in open(env_path):
-            if line.startswith(ESC_KEYNAME + "="):
-                headers["Authorization"] = "Bearer " + line.strip().split("=", 1)[1]
-                break
+    api_key = os.environ.get(ESC_KEYNAME, "").strip()
+    if not api_key and ENV_FILE:
+        env_path = os.path.expanduser(ENV_FILE)
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    raw = line.strip()
+                    if not raw or raw.startswith("#"):
+                        continue
+                    if raw.startswith("export "):
+                        raw = raw[len("export "):].lstrip()
+                    if raw.startswith(ESC_KEYNAME + "="):
+                        val = raw.split("=", 1)[1].strip()
+                        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                            val = val[1:-1]
+                        api_key = val
+                        break
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     return headers
 
 
@@ -106,10 +144,9 @@ def _strip_tags_from_history(payload):
     a 'routing layer' it cannot see. Returns a new payload with clean
     assistant content; other messages untouched.
     """
-    import re
-    # any bracketed tag line led by the route icons: exact configured tags,
-    # renamed tags from older configs, and model-imitated variants all match
-    tag_line = re.compile(r"^\s*\[(🟢|⚡)[^\]]*\]\s*$")
+    # any bracketed or bare route-icon tag, plus exact configured tags
+    tag_line = re.compile(r"^\s*(?:\[(?:🟢|⚡)[^\]]*\]|(?:🟢|⚡))\s*$")
+    configured = {t.strip() for t in (TAG_LOCAL, TAG_ESC) if t and t.strip()}
     msgs = payload.get("messages")
     if not msgs:
         return payload
@@ -120,7 +157,10 @@ def _strip_tags_from_history(payload):
                 and isinstance(m.get("content"), str):
             c = m["content"]
             # strip any tag line (configured, renamed, or imitated)
-            lines = [ln for ln in c.split("\n") if not tag_line.match(ln)]
+            lines = [
+                ln for ln in c.split("\n")
+                if not tag_line.match(ln) and ln.strip() not in configured
+            ]
             new_c = "\n".join(lines)
             if new_c != c:
                 m = dict(m)
@@ -159,7 +199,6 @@ def _thread_decision_id(payload, decision_id):
     reliable surface because it survives all transports (HTTP headers may be
     stripped by intermediaries, but a system-prompt stanza always reaches the model).
     """
-    import copy
     msgs = copy.deepcopy(payload.get("messages") or [])
     stanza = f"ROUTING DECISION ID: {decision_id} — include this id in any follow-up metadata."
     # Insert at position 0 so it's the first context the model sees.
@@ -169,17 +208,43 @@ def _thread_decision_id(payload, decision_id):
 
 def _judge(task_text):
     """Ask Laya via the proven hook client. Returns (p_hard, flag, source)."""
-    try:
-        j = laya_hook.apply(laya_hook.judge(task_text))
-        return j.get("p_hard"), bool(j.get("difficulty_flag")), j.get("source", "laya")
-    except Exception:
-        raise
+    j = laya_hook.apply(laya_hook.judge(task_text, sidecar_url=JUDGE_URL))
+    return j.get("p_hard"), bool(j.get("difficulty_flag")), j.get("source", "laya")
+
+
+def _decide_route(
+    has_harness: bool,
+    p_hard,
+    flag: bool,
+    source: str,
+    fallback_route: str | None = None,
+) -> tuple[str, str, str | None]:
+    """Choose (decision, tag, rule) from judge output and fallback policy."""
+    fb = (FALLBACK_ROUTE if fallback_route is None else fallback_route).strip().lower()
+    if fb not in ("local", "escalate"):
+        fb = "local"
+    judge_failed = source in ("fallback", "judge-failed")
+    if judge_failed:
+        if fb == "escalate":
+            return (
+                "passthrough-harness" if has_harness else "escalate",
+                TAG_ESC,
+                "judge-failed-escalate",
+            )
+        return (
+            "local-harness" if has_harness else "local",
+            TAG_LOCAL,
+            "judge-failed-local",
+        )
+    if flag:
+        return ("passthrough-harness" if has_harness else "escalate", TAG_ESC, None)
+    return ("local-harness" if has_harness else "local", TAG_LOCAL, None)
 
 
 def _log(rec):
     try:
         os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-        with open(LOG_FILE, "a") as f:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec) + "\n")
     except Exception:
         pass  # logging must never break the chat
@@ -187,7 +252,13 @@ def _log(rec):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "proxy": "rovik", "local": LOCAL_URL, "judge": JUDGE_URL}
+    return {
+        "ok": True,
+        "proxy": "rovik",
+        "local": LOCAL_URL,
+        "judge": JUDGE_URL,
+        "fallback_route": FALLBACK_ROUTE,
+    }
 
 
 @app.get("/v1/models")
@@ -210,54 +281,29 @@ async def chat(request: Request):
 
     try:
         # 0. Route decision
-        if _needs_harness(payload):
-            # Rule v2: tool tasks are JUDGED. Simple tool work (p_hard low) goes
-            # LOCAL — the 35B proved clean function-calling (bench: 11/11 format,
-            # 11/11 args, 8/8 followup). Hard tool work passes to the session model.
-            task = _latest_user_text(messages)
-            rec["task"] = task[:200]
-            try:
-                p_hard, flag, source = _judge(task)
-            except Exception:
-                p_hard, flag, source = None, False, "judge-failed"
-            rec["p_hard"], rec["source"] = p_hard, source
-            if flag or source == "judge-failed":
-                # hard tool work, or can't judge → session model (conservative
-                # for harness integrity; deep tool chains untested locally)
-                # v3: tag it too — every escalation must be visible to the human
-                decision, tag = "passthrough-harness", TAG_ESC
-            else:
-                decision, tag = "local-harness", TAG_LOCAL
-        else:
-            task = _latest_user_text(messages)
-            rec["task"] = task[:200]
-            try:
-                p_hard, flag, source = _judge(task)
-            except Exception:
-                p_hard, flag, source = None, False, "judge-failed"
-            rec["p_hard"], rec["source"] = p_hard, source
-            if flag:
-                decision = "escalate"
-            elif source == "judge-failed":
-                decision = "escalate"  # fail-open to the session model
-            else:
-                decision = "local"
-            tag = TAG_LOCAL if decision == "local" else TAG_ESC
+        has_harness = _needs_harness(payload)
+        task = task_text_raw
+        rec["task"] = task[:200]
+        try:
+            p_hard, flag, source = _judge(task)
+        except Exception:
+            p_hard, flag, source = None, False, "judge-failed"
+        rec["p_hard"], rec["source"] = p_hard, source
+        decision, tag, rule = _decide_route(has_harness, p_hard, flag, source)
         rec["decision"] = decision
-
-        # Outcome-capture: classify as local or frontier for training signal.
         rec["routed_to"] = "local" if decision in ("local", "local-harness") else "frontier"
+        if rule:
+            rec["rule"] = rule
 
         # 1. Route (local + local-harness both go to the 35B, tools forwarded)
+        upstream = None
         if decision in ("local", "local-harness"):
             try:
                 local_payload = _strip_tags_from_history(dict(payload))
-                local_payload["model"] = "local-35b"
+                local_payload["model"] = LOCAL_MODEL
                 local_payload.pop("chat_template_kwargs", None)  # llama-server args differ
                 # Thread outcome-capture key into the request so it can be echoed back.
                 _thread_decision_id(local_payload, decision_id)
-                rec["upstream"] = ("local", LOCAL_URL, local_payload,
-                                   {"Content-Type": "application/json"})
                 if not payload.get("stream"):
                     resp = _post(LOCAL_URL, local_payload,
                                  {"Content-Type": "application/json"}, 600)
@@ -267,27 +313,35 @@ async def chat(request: Request):
                         resp["choices"][0]["message"]["content"] = f"{tag}\n{content}"
                     if isinstance(resp.get("usage"), dict):
                         rec["usage"] = resp["usage"]
+                    rec["upstream"] = ["local", LOCAL_URL]
+                    rec["answered_by"] = LOCAL_MODEL
                     _log(rec)
                     return JSONResponse(resp)
                 # streaming: fall through to SSE relay with local upstream
-                rec["answered_by"] = "local-35b"
+                upstream = ("local", LOCAL_URL, local_payload,
+                            {"Content-Type": "application/json"})
+                rec["answered_by"] = LOCAL_MODEL
             except Exception as e:
                 rec["local_error"] = str(e)[:120]
                 rec["rule"] = "local-failed-escalate"
-                # fall through to escalation
+                upstream = None
+                decision = "passthrough-harness" if has_harness else "escalate"
+                rec["decision"] = decision
+                rec["routed_to"] = "frontier"
+                tag = TAG_ESC
 
         # 2. Escalation / pass-through: the session model, unchanged
-        if "upstream" not in rec:
+        if upstream is None:
             esc_payload = _strip_tags_from_history(dict(payload))
             esc_payload["model"] = os.environ.get("ROVIK_ESC_MODEL", "z-ai/glm-5.3")
             esc_payload.pop("chat_template_kwargs", None)  # llama-server-specific
             # Thread outcome-capture key into the escalation request too.
             _thread_decision_id(esc_payload, decision_id)
-            rec["upstream"] = ("esc", ESC_URL, esc_payload, _esc_headers())
+            upstream = ("esc", ESC_URL, esc_payload, _esc_headers())
             rec["answered_by"] = "session-model"
 
-        kind, up_url, up_payload, up_headers = rec["upstream"]
-        rec["upstream"] = [kind, up_url, {k: v for k, v in up_payload.items() if k != "stream_options"}, "<headers-redacted>"]
+        kind, up_url, up_payload, up_headers = upstream
+        rec["upstream"] = [kind, up_url]
         if payload.get("stream") and kind == "esc":
             up_payload.setdefault("stream_options", {})["include_usage"] = True
 
@@ -295,7 +349,6 @@ async def chat(request: Request):
         if payload.get("stream"):
 
             def sse_relay():
-                import urllib.error
                 try:
                     req = urllib.request.Request(
                         up_url, data=json.dumps(up_payload).encode(),
@@ -352,7 +405,7 @@ async def chat(request: Request):
 def _read_log():
     recs = []
     try:
-        with open(LOG_FILE) as f:
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
             for line in f:
                 try:
                     recs.append(json.loads(line))
@@ -403,7 +456,7 @@ def stats():
 def dashboard():
     page = os.path.join(HERE, "dashboard.html")
     if os.path.exists(page):
-        with open(page) as f:
+        with open(page, "r", encoding="utf-8") as f:
             return HTMLResponse(f.read())
     return HTMLResponse("<h1>Rovik</h1><p>proxy is running; dashboard.html not found</p>")
 

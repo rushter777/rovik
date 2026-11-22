@@ -19,19 +19,23 @@ Matching key resolution:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import sys
-from datetime import datetime, timezone
 
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_OUTPUT = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "outcome_events.jsonl"
-)
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOG_DIR = os.environ.get("ROVIK_LOG_DIR", os.path.join(REPO_ROOT, "data"))
+DEFAULT_OUTPUT = os.path.join(LOG_DIR, "outcome_events.jsonl")
+
+_DECISION_ID_RE = re.compile(r"ROUTING DECISION ID:\s*([a-fA-F0-9]+)")
+_HERMES_LOG_RE = re.compile(r"^ts=(\S+)\s+event=(\S+)\s+payload=(.+)$")
 
 EVENT_TYPES = [
     "tool_error",
@@ -167,6 +171,10 @@ def extract_events_from_transcript(messages: list[dict], decision_id: str | None
     if not messages:
         return events
 
+    cur_decision_id = decision_id
+    cur_task_hash = task_text_hash
+    error_turn_indices = set()
+
     # Collect all text content with indices for cross-referencing.
     turns = []
     for i, m in enumerate(messages):
@@ -179,9 +187,20 @@ def extract_events_from_transcript(messages: list[dict], decision_id: str | None
                     p.get("text", "") for p in content
                     if isinstance(p, dict) and isinstance(p.get("type"), str) and p["type"] == "text"
                 )
+
+        if decision_id is None:
+            if m.get("decision_id"):
+                cur_decision_id = m.get("decision_id")
+            elif isinstance(content, str):
+                match = _DECISION_ID_RE.search(content)
+                if match:
+                    cur_decision_id = match.group(1)
+
+        if task_text_hash is None and role == "user" and isinstance(content, str) and content.strip():
+            cur_task_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+
         ts = m.get("ts") or m.get("timestamp") or ""
         tool_name = m.get("tool_name") or m.get("tool", "")
-        error_class = None
         excerpt = ""
 
         # Detect tool errors.
@@ -196,10 +215,11 @@ def extract_events_from_transcript(messages: list[dict], decision_id: str | None
                     is_err = True
                     excerpt = str(error_output)[:200]
             if is_err:
+                error_turn_indices.add(i)
                 events.append({
                     "event_ts": ts,
-                    "decision_id": decision_id,
-                    "task_text_hash": task_text_hash,
+                    "decision_id": cur_decision_id,
+                    "task_text_hash": cur_task_hash,
                     "event_type": "tool_error",
                     "signal": {
                         "tool_name": tool_name or "unknown",
@@ -212,10 +232,11 @@ def extract_events_from_transcript(messages: list[dict], decision_id: str | None
 
         # Detect assistant error messages.
         if role == "assistant" and isinstance(content, str) and _is_error(content):
+            error_turn_indices.add(i)
             events.append({
                 "event_ts": ts,
-                "decision_id": decision_id,
-                "task_text_hash": task_text_hash,
+                "decision_id": cur_decision_id,
+                "task_text_hash": cur_task_hash,
                 "event_type": "assistant_error_msg",
                 "signal": {
                     "excerpt": content[:200],
@@ -224,50 +245,63 @@ def extract_events_from_transcript(messages: list[dict], decision_id: str | None
                 "confidence": 0.7,
             })
 
-        turns.append({"role": role, "content": content, "ts": ts, "idx": i})
+        turns.append({
+            "role": role,
+            "content": content,
+            "ts": ts,
+            "idx": i,
+            "decision_id": cur_decision_id,
+            "task_text_hash": cur_task_hash,
+        })
 
-    # Detect user retries (compare consecutive user messages).
+    # Detect user retries (compare consecutive user turns after an assistant reply).
+    last_user_turn = turns[0] if turns and turns[0]["role"] == "user" else None
     for i in range(1, len(turns)):
         curr = turns[i]
         prev = turns[i - 1]
-        if curr["role"] == "user" and prev["role"] == "assistant":
-            is_retry, conf = _is_retry(curr["content"], prev["content"])
-            if is_retry:
-                # Check if prior assistant had an error.
-                prior_error = any(
-                    e["event_type"] in ("tool_error", "assistant_error_msg")
-                    for e in events
-                )
-                etype = "user_retry_after_error" if prior_error else "user_retry"
-                conf = 0.95 if prior_error else conf
+        if curr["role"] == "user":
+            if prev["role"] == "assistant" and last_user_turn is not None:
+                if isinstance(curr["content"], str) and isinstance(last_user_turn["content"], str):
+                    is_retry, conf = _is_retry(curr["content"], last_user_turn["content"])
+                    if is_retry:
+                        prior_error = any(
+                            last_user_turn["idx"] < err_idx < curr["idx"]
+                            for err_idx in error_turn_indices
+                        )
+                        etype = "user_retry_after_error" if prior_error else "user_retry"
+                        conf = 0.95 if prior_error else conf
+                        events.append({
+                            "event_ts": curr["ts"],
+                            "decision_id": last_user_turn["decision_id"],
+                            "task_text_hash": last_user_turn["task_text_hash"],
+                            "event_type": etype,
+                            "signal": {
+                                "prior_user_content": last_user_turn["content"][:100],
+                                "prior_assistant_content": prev["content"][:100] if isinstance(prev["content"], str) else "",
+                                "user_content": curr["content"][:200],
+                            },
+                            "latency_ms": None,
+                            "confidence": conf,
+                        })
+            last_user_turn = curr
+
+    # Detect explicit success.
+    for t in reversed(turns):
+        if t["role"] == "user" and isinstance(t["content"], str):
+            ok, conf = _is_success(t["content"])
+            if ok:
                 events.append({
-                    "event_ts": curr["ts"],
-                    "decision_id": decision_id,
-                    "task_text_hash": task_text_hash,
-                    "event_type": etype,
+                    "event_ts": t["ts"],
+                    "decision_id": t["decision_id"],
+                    "task_text_hash": t["task_text_hash"],
+                    "event_type": "explicit_success",
                     "signal": {
-                        "prior_assistant_content": prev["content"][:100],
-                        "user_content": curr["content"][:200],
+                        "user_content": t["content"][:200],
                     },
                     "latency_ms": None,
                     "confidence": conf,
                 })
-
-    # Detect explicit success.
-    for t in reversed(turns):
-        if t["role"] == "user" and _is_success(t["content"])[0]:
-            events.append({
-                "event_ts": t["ts"],
-                "decision_id": decision_id,
-                "task_text_hash": task_text_hash,
-                "event_type": "explicit_success",
-                "signal": {
-                    "user_content": t["content"][:200],
-                },
-                "latency_ms": None,
-                "confidence": _is_success(t["content"])[1],
-            })
-            break  # Only take the last success signal.
+                break  # Only take the last success signal.
 
     return events
 
@@ -280,7 +314,7 @@ def load_transcript(path: str) -> list[dict]:
     """Load a transcript file in auto-detected format."""
     if path.endswith(".jsonl"):
         msgs = []
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -290,8 +324,62 @@ def load_transcript(path: str) -> list[dict]:
                 except json.JSONDecodeError:
                     pass
         return msgs
+    elif path.endswith(".log"):
+        msgs = []
+        raw_lines = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                raw_lines.append(stripped)
+                m = _HERMES_LOG_RE.match(stripped)
+                if not m:
+                    continue
+                ts, event_name, payload_str = m.groups()
+                try:
+                    payload = json.loads(payload_str)
+                except json.JSONDecodeError:
+                    payload = {}
+                if not isinstance(payload, dict):
+                    payload = {"content": str(payload)}
+                ev_lower = event_name.lower()
+                role = payload.get("role")
+                if not role:
+                    if "tool" in ev_lower:
+                        role = "tool_result"
+                    elif "assistant" in ev_lower:
+                        role = "assistant"
+                    elif "system" in ev_lower:
+                        role = "system"
+                    else:
+                        role = "user"
+                content = (
+                    payload.get("content")
+                    or payload.get("text")
+                    or payload.get("output")
+                    or payload.get("error")
+                    or ""
+                )
+                msg = {
+                    "role": role,
+                    "content": content,
+                    "ts": payload.get("ts") or ts,
+                }
+                tool_name = payload.get("tool_name") or payload.get("tool")
+                if tool_name:
+                    msg["tool_name"] = tool_name
+                if payload.get("decision_id"):
+                    msg["decision_id"] = payload["decision_id"]
+                msgs.append(msg)
+        if msgs:
+            return msgs
+        return [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": ln, "ts": str(i)}
+            for i, ln in enumerate(raw_lines)
+        ]
     elif path.endswith(".json"):
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
             return data
@@ -299,7 +387,7 @@ def load_transcript(path: str) -> list[dict]:
     else:
         # Treat as raw text — one message per line.
         msgs = []
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             for i, line in enumerate(f):
                 msgs.append({"role": "user" if i % 2 == 0 else "assistant",
                              "content": line.strip(), "ts": str(i)})
@@ -313,7 +401,7 @@ def load_transcript(path: str) -> list[dict]:
 def main():
     args = sys.argv[1:]
     if not args:
-        print("Usage: python outcome_extract.py <transcript_file> [output_file]", flush=True)
+        print("Usage: python -m serving.outcome_extract <transcript_file> [output_file]", flush=True)
         sys.exit(1)
 
     transcript_path = args[0]
@@ -334,7 +422,7 @@ def main():
         print("No outcome events detected.", flush=True)
         return
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "a", encoding="utf-8") as f:
         for event in events:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")

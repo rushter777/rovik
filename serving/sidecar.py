@@ -2,16 +2,19 @@
 Laya MLX sidecar — FastAPI server on 127.0.0.1:8777.
 
 Loads the configured checkpoint once at startup, guards every prediction
-with a threading.Lock (single forward pass at a time), and serves a
-/health endpoint plus a /predict POST endpoint.
+with a threading.Lock (single forward pass at a time), periodically sweeps
+the MLX Metal buffer pool to bound memory fragmentation, and serves a /health
+endpoint plus a /predict POST endpoint.
 """
 
-import json
-import threading
-import sys
-import os
+from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException
+from contextlib import asynccontextmanager
+import gc
+import os
+import threading
+
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 import uvicorn
 
@@ -51,7 +54,14 @@ QUESTION_SET = {
         "instructions": "Does an answer to this task need double-checking before it is used?",
         "criteria": {"true": "the stakes are high or errors would cost something", "false": "a quick answer is fine and low-stakes"},
     },
+    "difficulty": {
+        "type": "score",
+        "instructions": "Rate how demanding this task is for an assistant, as a count of objective demands: dependent multi-step, discovery/diagnosis, design choice, execution verification.",
+        "criteria": ["0-none", "1-one demand", "2-two demands", "3-three demands", "4-four demands"],
+    },
 }
+
+CLEAR_CACHE_EVERY = int(os.environ.get("LAYA_CLEAR_CACHE_EVERY", "10"))
 
 # ---------------------------------------------------------------------------
 # Model loading (once, under lock)
@@ -60,6 +70,17 @@ QUESTION_SET = {
 _lock = threading.Lock()
 _agent = None
 _load_error: str | None = None
+_request_count = 0
+
+
+def _clear_mlx_cache():
+    """Release MLX's pooled Metal buffers to prevent shape-fragmentation growth."""
+    try:
+        import mlx.core as mx
+        mx.clear_cache()
+    except Exception:
+        pass
+    gc.collect()
 
 def _load_model():
     """Load the Laya model into global _agent. Must be called under _lock."""
@@ -77,29 +98,38 @@ def _load_model():
 # FastAPI app
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Laya MLX Sidecar")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load model on startup and clean up resources on shutdown."""
+    global _agent
+    with _lock:
+        _load_model()
+        if _agent is not None:
+            try:
+                _agent.predict("warmup task", QUESTION_SET)
+            except Exception:
+                pass  # warm-up failure is non-fatal
+    try:
+        yield
+    finally:
+        with _lock:
+            _agent = None
+            _clear_mlx_cache()
 
 
-@app.on_event("startup")
-def startup():
-    """Load model at startup. If it fails, /health returns ok=false."""
-    _load_model()
-    # Warm-up predict if model loaded successfully
-    if _agent is not None:
-        try:
-            _agent.predict(
-                "warmup task",
-                QUESTION_SET,
-            )
-        except Exception:
-            pass  # warm-up failure is non-fatal
+app = FastAPI(title="Laya MLX Sidecar", lifespan=lifespan)
 
 
 @app.get("/health")
 def health():
     """Return model load status."""
     if _agent is not None:
-        return {"ok": True, "model": MODEL_PATH}
+        return {
+            "ok": True,
+            "model": MODEL_PATH,
+            "requests": _request_count,
+            "clear_cache_every": CLEAR_CACHE_EVERY,
+        }
     return JSONResponse(
         status_code=503,
         content={"ok": False, "model": MODEL_PATH, "error": _load_error or "model failed to load"},
@@ -109,6 +139,7 @@ def health():
 @app.post("/predict")
 def predict(payload: dict):
     """Run a single forward pass through the Laya model."""
+    global _request_count
     if _agent is None:
         return JSONResponse(
             status_code=503,
@@ -121,6 +152,9 @@ def predict(payload: dict):
     try:
         with _lock:
             result = _agent.predict(state, questions)
+            _request_count += 1
+            if CLEAR_CACHE_EVERY > 0 and _request_count % CLEAR_CACHE_EVERY == 0:
+                _clear_mlx_cache()
         # predict() returns {"answers": {qid: {...}}, "usage": {...}} — surface
         # just the answers map under the same key (no double nesting).
         return {"answers": result.get("answers", result)}
@@ -132,15 +166,9 @@ def predict(payload: dict):
 
 
 def main():
+    host = os.environ.get("LAYA_SIDECAR_HOST", "127.0.0.1")
     port = int(os.environ.get("LAYA_SIDECAR_PORT", "8777"))
-    uvicorn.run(app, host="127.0.0.1", port=port)
-
-
-@app.on_event("shutdown")
-def shutdown():
-    """Graceful shutdown hook."""
-    global _agent
-    _agent = None
+    uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":

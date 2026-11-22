@@ -336,7 +336,7 @@ rovik/
 
 - **Cold starts:** Initial latency may spike while the model loads into unified memory. First requests after a sidecar restart pay the load cost; subsequent ones run at full speed (~40ms judgments on Apple Silicon). Warm the sidecar after deployment before you care about latency.
 - **Concurrency:** Tuned for local developer-workstation agent loops — one human, one assistant, sequential requests. Large-scale multi-tenant concurrency is not yet benchmarked; treat the proxy and sidecar as single-user until measured otherwise.
-- **Fail-safe behavior:** On unhandled router or classifier sidecar errors, Rovik fails gracefully back to the local model route (`FALLBACK_ROUTE=local`) rather than silently escalating to paid cloud APIs. A broken judge costs you speed, never money.
+- **Fail-safe behavior:** On unhandled router or classifier sidecar errors, Rovik fails gracefully back to the local model route (`ROVIK_FALLBACK_ROUTE=local`) rather than silently escalating to paid cloud APIs. A broken judge costs you speed, never money.
 
 ## 7. The four-model decomposition experiment
 

@@ -4,14 +4,19 @@ Reads judgment JSON (one per line) from stdin or a file argument,
 appends timestamped entries to data/shadow_log.jsonl (ROVIK_LOG_DIR to override).
 
 Fields written per entry:
-    ts             – ISO-8601 UTC timestamp
-    task_text      – raw task text from the judgment record
-    tools_file     – list of file-tool probabilities (floats)
-    tools_terminal – list of terminal-tool probabilities (floats)
-    tools_web      – list of web-tool probabilities (floats)
-    needs_verification – boolean derived from judgment fields
-    execution_outcome – outcome of actually running the task, if known
-                        ('success' | 'failed' | 'retried' | 'human_redo' | None)
+    ts                 – ISO-8601 UTC timestamp
+    task_text          – raw task text from the judgment record
+    tools_file         – file-tool probability (float | None)
+    tools_terminal     – terminal-tool probability (float | None)
+    tools_web          – web-tool probability (float | None)
+    needs_verification – verification probability (float | None)
+    p_hard             – difficulty P(score>=1) probability (float | None)
+    execution_outcome  – outcome of actually running the task, if known
+                         ('success' | 'failed' | 'retried' | 'human_redo' | None)
+    source             – 'laya' | 'fallback' | sidecar model name if present
+    decision_id        – routing decision join key (str | None)
+    task_text_hash     – truncated SHA-256 of task text (str | None)
+    routed_to          – 'local' | 'frontier' | None
 
 Stdlib only. Never raises. Never modifies anything outside the log file.
 """
@@ -93,11 +98,13 @@ def _extract_p_hard(record):
         diff = source.get("difficulty")
         if isinstance(diff, dict):
             probs = diff.get("probabilities")
-            if isinstance(probs, dict) and "0-none" in probs:
-                try:
-                    return 1.0 - float(probs["0-none"])
-                except (TypeError, ValueError):
-                    return None
+            if isinstance(probs, dict):
+                p_none = probs.get("0", probs.get("0-none"))
+                if p_none is not None:
+                    try:
+                        return 1.0 - float(p_none)
+                    except (TypeError, ValueError):
+                        return None
     return None
 
 

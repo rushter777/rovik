@@ -59,14 +59,15 @@ class TestJudge(unittest.TestCase):
     def setUp(self):
         _FakeHandler.response_body = None
         _FakeHandler.status = None
-        self.srv = HTTPServer(("127.0.0.1", 18777), _FakeHandler)
+        self.srv = HTTPServer(("127.0.0.1", 0), _FakeHandler)
         Thread(target=self.srv.serve_forever, daemon=True).start()
 
     def tearDown(self):
         self.srv.shutdown()
+        self.srv.server_close()
 
     def _url(self, path="/predict"):
-        return f"http://127.0.0.1:18777{path}"
+        return f"http://127.0.0.1:{self.srv.server_port}{path}"
 
     def test_success_parses_answers(self):
         _FakeHandler.response_body = {"tools_file": _ans(0.9)}

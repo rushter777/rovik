@@ -3,10 +3,11 @@ Laya hook — stdlib-only client for the Laya MLX sidecar.
 
 Provides two public functions:
 
-    judge(task_text) -> dict | None
-        POSTs task_text to http://127.0.0.1:8777/predict with the fixed
-        question set.  On ANY failure (connection refused, timeout, 5xx,
-        bad JSON) returns None — never raises, never blocks the caller.
+    judge(task_text, sidecar_url=None) -> dict | None
+        POSTs task_text to sidecar_url (defaults to _SIDECAR_URL,
+        http://127.0.0.1:8777/predict) with the fixed question set.  On ANY
+        failure (connection refused, timeout, 5xx, bad JSON) returns None —
+        never raises, never blocks the caller.
 
     apply(decisions) -> dict
         Describes the dispatch configuration derived from a judge()
@@ -30,10 +31,11 @@ NOTE on thresholds:
     Thresholds must be tuned on MLX outputs before deployment.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import urllib.request
-import urllib.error
 
 # ---------------------------------------------------------------------------
 # Fixed question set (must match the sidecar's QUESTION_SET)
@@ -82,16 +84,17 @@ _SIDECAR_URL = os.environ.get("LAYA_SIDECAR_URL", "http://127.0.0.1:8777/predict
 _TIMEOUT_S = 2
 
 
-def judge(task_text: str) -> dict | None:
+def judge(task_text: str, sidecar_url: str | None = None) -> dict | None:
     """Send task_text to the Laya sidecar and return the answers dict.
 
     Returns None on any failure (connection refused, timeout, HTTP error,
     malformed JSON).  Never raises and never blocks the caller.
     """
     try:
+        url = sidecar_url or _SIDECAR_URL
         body = json.dumps({"state": task_text, "questions": QUESTION_SET}).encode("utf-8")
         req = urllib.request.Request(
-            _SIDECAR_URL,
+            url,
             data=body,
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -187,7 +190,7 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("Usage: python laya_hook.py 'task description'", flush=True)
+        print("Usage: python -m serving.hook 'task description'", flush=True)
         sys.exit(1)
 
     task = " ".join(sys.argv[1:])

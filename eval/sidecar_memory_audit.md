@@ -116,8 +116,8 @@ if request_count % 10 == 0:
 
 Full reproduction script at `eval/bench_sidecar_memory.py` — run with:
 ```bash
-LAYA_MODEL_PATH=/Users/apollo/laya-router/checkpoints/laya-v3d-mlx \
-/Users/apollo/laya-mlx-venv/bin/python eval/bench_sidecar_memory.py
+LAYA_MODEL_PATH=checkpoints/laya-ft \
+python3 eval/bench_sidecar_memory.py
 ```
 
 Or with `N_REQUESTS=200` for longer runs.
