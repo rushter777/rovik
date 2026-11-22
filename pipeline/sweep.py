@@ -12,8 +12,6 @@ Defaults: checkpoints/cold-test, data/synthetic/synthetic_corpus.jsonl
 import json
 import os
 import sys
-import time
-import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -22,21 +20,25 @@ import torch
 from safetensors.torch import load_file
 from transformers import AutoTokenizer
 
-from eval_laya import _fix_tokenizer_config, build_model, load_jsonl, QTYPES
+try:
+    from pipeline.eval_laya import QTYPES, _fix_tokenizer_config, build_model, load_jsonl
+except ImportError:
+    from eval_laya import QTYPES, _fix_tokenizer_config, build_model, load_jsonl
 from laya.common import build_sequence, collate_items
-
-CKPT = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/cold-test"
-DATA = sys.argv[2] if len(sys.argv) > 2 else "data/synthetic/synthetic_corpus.jsonl"
 
 
 def main():
-    device = torch.device("mps")
-    _fix_tokenizer_config(CKPT)
-    cfg = json.load(open(os.path.join(CKPT, "rl_agent_config.json")))
-    tok = AutoTokenizer.from_pretrained(os.path.join(CKPT, "tokenizer"))
-    enc_dir = os.path.join(CKPT, "encoder")
+    ckpt = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/cold-test"
+    data = sys.argv[2] if len(sys.argv) > 2 else "data/synthetic/synthetic_corpus.jsonl"
+
+    device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+    _fix_tokenizer_config(ckpt)
+    with open(os.path.join(ckpt, "rl_agent_config.json"), "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    tok = AutoTokenizer.from_pretrained(os.path.join(ckpt, "tokenizer"))
+    enc_dir = os.path.join(ckpt, "encoder")
     model = build_model(cfg, encoder_dir=enc_dir if os.path.exists(enc_dir) else None)
-    model.load_state_dict(load_file(os.path.join(CKPT, "model.safetensors")), strict=True)
+    model.load_state_dict(load_file(os.path.join(ckpt, "model.safetensors")), strict=True)
     model.to(device).eval()
     temp_score = cfg.get("temperature", [1, 1, 1])[1]
     print(f"Model loaded. score temperature={temp_score:.3f}")
@@ -44,11 +46,10 @@ def main():
     max_len = cfg.get("max_len", 512)
     head_max_len = cfg.get("head_max_len", 192)
 
-    rows = load_jsonl(DATA)
+    rows = load_jsonl(data)
     print(f"{len(rows)} eval tasks")
 
     probs_hard, golds = [], []
-    bs = 16
     for row in rows:
         state = row["state"]
         if isinstance(state, str) and state[:1] in ("{", "["):

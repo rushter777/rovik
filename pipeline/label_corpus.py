@@ -9,9 +9,9 @@ http://127.0.0.1:8081/v1/chat/completions; model name via ROVIK_TEACHER_MODEL).
 
 import json
 import os
-import random
 import sys
 import time
+import urllib.parse
 import urllib.request
 
 API = os.environ.get("ROVIK_TEACHER_URL", "http://127.0.0.1:8081/v1/chat/completions")
@@ -38,18 +38,25 @@ Task text:
 
 
 def ask(task_text, retries=3):
-    body = json.dumps({
+    payload = {
         "model": MODEL,
         "messages": [{"role": "user", "content": RUBRIC + task_text}],
-        "temperature": 0.7,
-        "top_p": 0.8,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "presence_penalty": 0.0,
         "max_tokens": 60,
-        "chat_template_kwargs": {"enable_thinking": False},
-    }).encode()
+    }
+    if (urllib.parse.urlparse(API).hostname or "").lower() in ("127.0.0.1", "localhost", "::1"):
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    headers = {"Content-Type": "application/json"}
+    key_name = os.environ.get("ROVIK_TEACHER_KEYNAME", "").strip()
+    api_key = os.environ.get(key_name, "").strip() if key_name else ""
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    body = json.dumps(payload).encode()
     for attempt in range(retries):
         try:
-            req = urllib.request.Request(API, data=body,
-                                         headers={"Content-Type": "application/json"})
+            req = urllib.request.Request(API, data=body, headers=headers)
             with urllib.request.urlopen(req, timeout=120) as r:
                 resp = json.loads(r.read())
             raw = resp["choices"][0]["message"]["content"].strip()

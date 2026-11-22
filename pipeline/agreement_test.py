@@ -21,15 +21,12 @@ import os
 import random
 import sys
 import time
+import urllib.parse
 import urllib.request
-import urllib.error
-from collections import Counter
 
 API = os.environ.get("ROVIK_TEACHER_URL", "http://127.0.0.1:8081/v1/chat/completions")
 MODEL = os.environ.get("ROVIK_TEACHER_MODEL", "local-model")
-DATA = sys.argv[2] if len(sys.argv) > 2 else "data/synthetic/synthetic_corpus.jsonl"
 OUT = os.environ.get("ROVIK_AGREEMENT_OUT", "data/agreement_test.jsonl")
-N = int(sys.argv[1]) if len(sys.argv) > 1 else 100
 
 RUBRIC = """You are labeling a task that a user gave to an AI assistant (which has file, shell, and web tools). Answer 5 yes/no questions using ONLY the request text. Two careful readers must be able to agree from the text alone. Answer strictly as JSON.
 
@@ -51,18 +48,25 @@ Task text:
 
 
 def ask(task_text, retries=3):
-    body = json.dumps({
+    payload = {
         "model": MODEL,
         "messages": [{"role": "user", "content": RUBRIC + task_text}],
         "temperature": 0.7,
         "top_p": 0.8,
+        "presence_penalty": 0.0,
         "max_tokens": 60,
-        "chat_template_kwargs": {"enable_thinking": False},
-    }).encode()
+    }
+    if (urllib.parse.urlparse(API).hostname or "").lower() in ("127.0.0.1", "localhost", "::1"):
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    headers = {"Content-Type": "application/json"}
+    key_name = os.environ.get("ROVIK_TEACHER_KEYNAME", "").strip()
+    api_key = os.environ.get(key_name, "").strip() if key_name else ""
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    body = json.dumps(payload).encode()
     for attempt in range(retries):
         try:
-            req = urllib.request.Request(API, data=body,
-                                         headers={"Content-Type": "application/json"})
+            req = urllib.request.Request(API, data=body, headers=headers)
             with urllib.request.urlopen(req, timeout=120) as r:
                 resp = json.loads(r.read())
             raw = resp["choices"][0]["message"]["content"].strip()
@@ -84,9 +88,12 @@ def ask(task_text, retries=3):
 
 
 def main():
-    rows = [json.loads(l) for l in open(DATA)]
+    n_sample = int(sys.argv[1]) if len(sys.argv) > 1 else 100
+    data_path = sys.argv[2] if len(sys.argv) > 2 else "data/synthetic/synthetic_corpus.jsonl"
+    with open(data_path, "r", encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f if line.strip()]
     random.seed(42)
-    sample = random.sample(rows, min(N, len(rows)))
+    sample = random.sample(rows, min(n_sample, len(rows)))
     print(f"Asking {len(sample)} tasks x 2 passes x 5 questions on the MoE...", flush=True)
 
     results = []

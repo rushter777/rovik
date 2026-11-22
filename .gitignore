@@ -12,11 +12,19 @@ data/shadow_log_enriched.jsonl
 agreement_test.jsonl
 tier_agreement.jsonl
 
+# Local config & secrets — never commit your configured env or keys
+rovik.env
+.env
+!rovik.env.example
+
 # Python
 __pycache__/
 *.pyc
 .venv/
 venv/
+build/
+dist/
+*.egg-info/
 
 # macOS
 .DS_Store
