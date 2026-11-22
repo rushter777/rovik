@@ -93,7 +93,7 @@ The fail-safe is the load-bearing wall: the classifier may be wrong, dead, or sl
 ## 5. Repository structure
 
 ```
-bouncer/
+rovik/
 ├── README.md                 # this write-up
 ├── docs/
 │   ├── method.md             # §2 expanded, with the four-model comparison

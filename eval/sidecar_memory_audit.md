@@ -1,7 +1,7 @@
 # Sidecar Memory Audit — MLX Inference Loop
 
 **Date:** 2026-10-11  
-**Test:** 3 of Bouncer test suite  
+**Test:** 3 of Rovik test suite  
 **Stack:** MLX 0.32.2 + laya_mlx (Laya v3d checkpoint) on macOS Metal  
 **Agent class:** `laya_mlx.agent.Agent` — stateless per call, no retained history
 

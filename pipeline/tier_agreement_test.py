@@ -4,8 +4,8 @@
 Binary formulation: local (the local model can complete it alone) vs escalate
 (needs a bigger/cloud model). 100 sample tasks, 2 passes each, temp 0.7.
 Gate: >=85% self-agreement to justify consensus relabeling.
-Teacher: any OpenAI-compatible local server (BOUNCER_TEACHER_URL, default
-http://127.0.0.1:8081/v1/chat/completions; model name via BOUNCER_TEACHER_MODEL).
+Teacher: any OpenAI-compatible local server (ROVIK_TEACHER_URL, default
+http://127.0.0.1:8081/v1/chat/completions; model name via ROVIK_TEACHER_MODEL).
 """
 
 import json
@@ -15,10 +15,10 @@ import sys
 import time
 import urllib.request
 
-API = os.environ.get("BOUNCER_TEACHER_URL", "http://127.0.0.1:8081/v1/chat/completions")
-MODEL = os.environ.get("BOUNCER_TEACHER_MODEL", "local-model")
+API = os.environ.get("ROVIK_TEACHER_URL", "http://127.0.0.1:8081/v1/chat/completions")
+MODEL = os.environ.get("ROVIK_TEACHER_MODEL", "local-model")
 DATA = sys.argv[2] if len(sys.argv) > 2 else "data/synthetic/synthetic_corpus.jsonl"
-OUT = os.environ.get("BOUNCER_TIER_OUT", "data/tier_agreement.jsonl")
+OUT = os.environ.get("ROVIK_TIER_OUT", "data/tier_agreement.jsonl")
 
 RUBRIC = """You are labeling a task that a user gave to an AI assistant. The assistant runs on a single local machine and uses a local small model (strong at routine coding, file work, shell tasks, and lookups; weak at long multi-step debugging chains, deep architectural reasoning, and very obscure domain knowledge). Cloud models are stronger but cost money and leak data.
 

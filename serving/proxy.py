@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bouncer proxy — the model switch, sitting where the session model's door is.
+"""Rovik proxy — the local-first model routing switch.
 
 OpenAI-compatible /v1/chat/completions endpoint that routes per request:
 
@@ -18,13 +18,13 @@ Fail-safe: ANY error anywhere → pass through to the session model. The proxy
 must never be the reason a chat breaks.
 
 Env:
-    BOUNCER_PROXY_PORT   (default 8788)
-    BOUNCER_LOCAL_URL    (default http://127.0.0.1:8081/v1/chat/completions)
-    BOUNCER_JUDGE_URL    (default http://127.0.0.1:8777/predict)
-    BOUNCER_ESC_URL      (default https://openrouter.ai/api/v1/chat/completions)
-    BOUNCER_ESC_MODEL    (default z-ai/glm-5.3 — swap frontier providers without code changes)
-    BOUNCER_ESC_KEYNAME   (default OPENROUTER_API_KEY — name of env var holding the key)
-    BOUNCER_PROXY_HOST / BOUNCER_PROXY_PORT  (default 127.0.0.1:8788)
+    ROVIK_PROXY_PORT   (default 8788)
+    ROVIK_LOCAL_URL    (default http://127.0.0.1:8081/v1/chat/completions)
+    ROVIK_JUDGE_URL    (default http://127.0.0.1:8777/predict)
+    ROVIK_ESC_URL      (default https://openrouter.ai/api/v1/chat/completions)
+    ROVIK_ESC_MODEL    (default z-ai/glm-5.3 — swap frontier providers without code changes)
+    ROVIK_ESC_KEYNAME   (default OPENROUTER_API_KEY — name of env var holding the key)
+    ROVIK_PROXY_HOST / ROVIK_PROXY_PORT  (default 127.0.0.1:8788)
     LAYA_THRESH_HARD     (default 0.8)
 """
 
@@ -42,14 +42,14 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import laya_hook  # the proven judge client: extractors + fail-safe, tested 14/14
 
-PROXY_PORT = int(os.environ.get("BOUNCER_PROXY_PORT", "8788"))
-PROXY_HOST = os.environ.get("BOUNCER_PROXY_HOST", "127.0.0.1")
-LOCAL_URL = os.environ.get("BOUNCER_LOCAL_URL", "http://127.0.0.1:8081/v1/chat/completions")
-JUDGE_URL = os.environ.get("BOUNCER_JUDGE_URL", "http://127.0.0.1:8777/predict")
-ESC_KEYNAME = os.environ.get("BOUNCER_ESC_KEYNAME", "OPENROUTER_API_KEY")
+PROXY_PORT = int(os.environ.get("ROVIK_PROXY_PORT", "8788"))
+PROXY_HOST = os.environ.get("ROVIK_PROXY_HOST", "127.0.0.1")
+LOCAL_URL = os.environ.get("ROVIK_LOCAL_URL", "http://127.0.0.1:8081/v1/chat/completions")
+JUDGE_URL = os.environ.get("ROVIK_JUDGE_URL", "http://127.0.0.1:8777/predict")
+ESC_KEYNAME = os.environ.get("ROVIK_ESC_KEYNAME", "OPENROUTER_API_KEY")
 # Frontier endpoint — swap providers without touching code (OpenRouter by default).
 ESC_URL = os.environ.get(
-    "BOUNCER_ESC_URL", "https://openrouter.ai/api/v1/chat/completions"
+    "ROVIK_ESC_URL", "https://openrouter.ai/api/v1/chat/completions"
 )
 THRESH = float(os.environ.get("LAYA_THRESH_HARD", "0.8"))
 
@@ -57,10 +57,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(HERE, "data", "proxy_log.jsonl")
 # Tags are user-facing receipts, fully configurable. Defaults describe THIS
 # machine's stack; override per deployment (icons-only works too, e.g.
-# BOUNCER_TAG_LOCAL="🟢"). History-stripping recognizes any bracketed
+# ROVIK_TAG_LOCAL="🟢"). History-stripping recognizes any bracketed
 # 🟢/⚡ tag regardless of exact text, so old tags never poison context.
-TAG_LOCAL = os.environ.get("BOUNCER_TAG_LOCAL", "[🟢 LOCAL · 35B-A3B]")
-TAG_ESC = os.environ.get("BOUNCER_TAG_ESC", "[⚡ ESCALATED · GLM 5.3]")
+TAG_LOCAL = os.environ.get("ROVIK_TAG_LOCAL", "[🟢 LOCAL · 35B-A3B]")
+TAG_ESC = os.environ.get("ROVIK_TAG_ESC", "[⚡ ESCALATED · GLM 5.3]")
 
 app = FastAPI()
 
@@ -99,7 +99,7 @@ def _latest_user_text(messages):
 
 
 def _strip_tags_from_history(payload):
-    """Remove bouncer tags from assistant messages before they go upstream.
+    """Remove Rovik tags from assistant messages before they go upstream.
 
     Tags are for the human, not the model: if tagged history reaches the
     model it (a) imitates the tag (double-tagging) and (b) speculates about
@@ -187,13 +187,13 @@ def _log(rec):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "proxy": "bouncer", "local": LOCAL_URL, "judge": JUDGE_URL}
+    return {"ok": True, "proxy": "rovik", "local": LOCAL_URL, "judge": JUDGE_URL}
 
 
 @app.get("/v1/models")
 def models():
-    return {"object": "list", "data": [{"id": "bouncer-proxy", "object": "model",
-            "created": int(time.time()), "owned_by": "bouncer"}]}
+    return {"object": "list", "data": [{"id": "rovik-proxy", "object": "model",
+            "created": int(time.time()), "owned_by": "rovik"}]}
 
 
 @app.post("/v1/chat/completions")
@@ -261,7 +261,7 @@ async def chat(request: Request):
                 if not payload.get("stream"):
                     resp = _post(LOCAL_URL, local_payload,
                                  {"Content-Type": "application/json"}, 600)
-                    resp["model"] = "bouncer-local-35b"
+                    resp["model"] = "rovik-local-35b"
                     content = resp["choices"][0]["message"].get("content") or ""
                     if tag:
                         resp["choices"][0]["message"]["content"] = f"{tag}\n{content}"
@@ -279,7 +279,7 @@ async def chat(request: Request):
         # 2. Escalation / pass-through: the session model, unchanged
         if "upstream" not in rec:
             esc_payload = _strip_tags_from_history(dict(payload))
-            esc_payload["model"] = os.environ.get("BOUNCER_ESC_MODEL", "z-ai/glm-5.3")
+            esc_payload["model"] = os.environ.get("ROVIK_ESC_MODEL", "z-ai/glm-5.3")
             esc_payload.pop("chat_template_kwargs", None)  # llama-server-specific
             # Thread outcome-capture key into the escalation request too.
             _thread_decision_id(esc_payload, decision_id)
@@ -320,7 +320,7 @@ async def chat(request: Request):
                                         pass
                             yield s
                 except Exception as e:
-                    err = json.dumps({"error": {"message": f"bouncer relay failure: {e}",
+                    err = json.dumps({"error": {"message": f"rovik relay failure: {e}",
                                                 "type": "proxy_error"}})
                     yield f"data: {err}\n\n"
                     yield "data: [DONE]\n\n"
@@ -345,7 +345,7 @@ async def chat(request: Request):
         # Fail-safe: log and re-raise as 502 so the caller's own fallback kicks in.
         rec["error"] = str(e)[:200]
         _log(rec)
-        return JSONResponse({"error": {"message": f"bouncer proxy failure: {e}"}},
+        return JSONResponse({"error": {"message": f"rovik proxy failure: {e}"}},
                             status_code=502)
 
 
@@ -365,7 +365,7 @@ def _read_log():
 
 # Frontier price used for savings estimates: blended $ per 1M tokens you
 # would have paid if every request went to the escalation model.
-PRICE_PER_MTOK = float(os.environ.get("BOUNCER_FRONTIER_PRICE_PER_MTOK", "3.0"))
+PRICE_PER_MTOK = float(os.environ.get("ROVIK_FRONTIER_PRICE_PER_MTOK", "3.0"))
 
 
 @app.get("/stats")
@@ -405,7 +405,7 @@ def dashboard():
     if os.path.exists(page):
         with open(page) as f:
             return HTMLResponse(f.read())
-    return HTMLResponse("<h1>Bouncer</h1><p>proxy is running; dashboard.html not found</p>")
+    return HTMLResponse("<h1>Rovik</h1><p>proxy is running; dashboard.html not found</p>")
 
 
 if __name__ == "__main__":

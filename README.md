@@ -1,6 +1,6 @@
 # The Router That Earns Its Keep
 
-![Banner — the bouncer at the door](assets/banner.png)
+![Rovik — local-first AI model router](assets/banner.png)
 
 **A practical pipeline for fine-tuning a small decision model (Laya) on your own tasks — including what failed, and why.**
 
@@ -18,7 +18,7 @@
 - [3. The scoreboard](#3-the-scoreboard)
 - [4. Serving architecture](#4-serving-architecture)
   - [4.0 Privacy and data handling](#40-privacy-and-data-handling)
-  - [4.1 The router (Bouncer proxy)](#41-the-router-bouncer-proxy--and-how-to-see-who-answered)
+  - [4.1 The router (Rovik proxy)](#41-the-router-rovik-proxy--and-how-to-see-who-answered)
   - [4.2 The savings dashboard](#42-the-savings-dashboard)
   - [4.3 The outcome ledger](#43-the-outcome-ledger--closing-the-loop-asynchronously)
 - [5. Repository structure](#5-repository-structure)
@@ -40,8 +40,8 @@ Verified end-to-end from a clean clone of this repo on Apple Silicon (M1, 64GB).
 - The base checkpoint (Apache-2.0) downloads anonymously from Hugging Face on first use (~800MB). No account, no token.
 
 ```bash
-git clone https://github.com/rushter777/bouncer.git
-cd bouncer
+git clone https://github.com/rushter777/rovik.git
+cd rovik
 
 # one venv for the training pipeline
 python3.11 -m venv .venv
@@ -204,9 +204,9 @@ The isolation boundary is explicit and load-bearing:
 - **Local-First:** Requests handled locally never leave the host machine. The classifier sidecar, the local model tier, and the shadow ledger all run on-loopback, on your hardware.
 - **Egress Boundary:** Upstream/frontier endpoints are only contacted when a task is *explicitly escalated* by the rule layer. No telemetry, no background requests, nothing leaves the host otherwise.
 - **Secret Isolation:** Upstream API keys are held strictly by the egress runner (the proxy's escalation path). They are never exposed to — and never required by — the local routing classifier or its sidecar.
-- **Harness Agnostic:** Bouncer exposes a standard `/v1/chat/completions` endpoint. It works with any OpenAI-compatible framework, custom agent loop, or harness — it is not tied exclusively to any single tool.
+- **Harness Agnostic:** Rovik exposes a standard `/v1/chat/completions` endpoint. It works with any OpenAI-compatible framework, custom agent loop, or harness — it is not tied exclusively to any single tool.
 
-### 4.1 The router (Bouncer proxy) — and how to see who answered
+### 4.1 The router (Rovik proxy) — and how to see who answered
 
 The judgment layer ships with an OpenAI-compatible **proxy** (`serving/proxy.py`) that does the actual routing: point any harness's `base_url` at it and easy prompts are answered by your local model, hard ones pass to the frontier model, tool-carrying prompts are judged too (simple tool work stays local; deep chains go to the frontier). The proxy is harness-agnostic — anything that speaks the OpenAI wire format can sit in front of it.
 
@@ -217,22 +217,22 @@ The judgment layer ships with an OpenAI-compatible **proxy** (`serving/proxy.py`
 Every routed reply carries a **tag** so the human always knows who answered. Tags are config, not code — the defaults describe one machine's stack, yours will differ:
 
 ```bash
-BOUNCER_TAG_LOCAL="[🟢 my-local-model]"   # green: local model answered
-BOUNCER_TAG_ESC="[⚡ my-frontier-model]"   # yellow: escalated to frontier
-# icons-only works too: BOUNCER_TAG_LOCAL="🟢" BOUNCER_TAG_ESC="⚡"
+ROVIK_TAG_LOCAL="[🟢 my-local-model]"   # green: local model answered
+ROVIK_TAG_ESC="[⚡ my-frontier-model]"   # yellow: escalated to frontier
+# icons-only works too: ROVIK_TAG_LOCAL="🟢" ROVIK_TAG_ESC="⚡"
 ```
 
 Two hard-won tag rules, learned from the first real session:
 
 1. **Tags are for the human, not the model.** The proxy strips every tag line from conversation history before forwarding upstream. Without this, the model sees tagged history, starts imitating the tag (double-tagging), and — asked about routing — confabulates explanations about a layer it cannot see.
-2. **Never hardcode model names.** Multi-frontier setups change the escalation target per workload (`BOUNCER_ESC_MODEL`); a tag that names a model goes stale the first time you swap. Icons + a naming scheme you control beats echoing whatever tonight's stack was.
+2. **Never hardcode model names.** Multi-frontier setups change the escalation target per workload (`ROVIK_ESC_MODEL`); a tag that names a model goes stale the first time you swap. Icons + a naming scheme you control beats echoing whatever tonight's stack was.
 
 ### 4.2 The savings dashboard
 
 Open the proxy's root URL (`http://127.0.0.1:8788/`) and you get a live dashboard: estimated dollars saved (tokens answered locally × your frontier's price), route mix, actual frontier spend, and the last ten decisions with their p_hard scores. One env var to set your price:
 
 ```bash
-BOUNCER_FRONTIER_PRICE_PER_MTOK=3.0   # blended $/1M tokens of your frontier model
+ROVIK_FRONTIER_PRICE_PER_MTOK=3.0   # blended $/1M tokens of your frontier model
 ```
 
 The estimate is honest about its basis: it counts only usage captured from upstream responses (the log line includes the token counts), and the page says so. It starts counting from when you deployed usage logging — it does not invent history.
@@ -276,10 +276,10 @@ The joiner is byte-offset-checkpointed (resume-able, never reprocesses), writes 
 ## 5. Repository structure
 
 ```
-bouncer/
+rovik/
 ├── README.md                 # this write-up
 ├── assets/
-│   └── banner.png            # the bouncer at the door (README header)
+│   └── banner.png            # Rovik header banner
 ├── docs/
 │   └── method.md             # §2 expanded, with the four-model comparison
 ├── pipeline/
@@ -293,7 +293,7 @@ bouncer/
 │   ├── sidecar.py            # FastAPI, health endpoint, env-config checkpoint
 │   ├── hook.py               # stdlib client, fail-safe, env thresholds
 │   ├── shadow.py             # append-only flight recorder (decision ledger)
-│   ├── proxy.py              # Bouncer: the routing switch + tags (see §4.1)
+│   ├── proxy.py              # Rovik: the routing switch + tags (see §4.1)
 │   ├── outcome_extract.py    # transcripts/logs → outcome events (see §4.3)
 │   ├── outcome_joiner.py     # async ledger enrichment: events + decisions → outcomes
 │   └── dashboard.html        # savings dashboard served at the proxy root
@@ -336,7 +336,7 @@ bouncer/
 
 - **Cold starts:** Initial latency may spike while the model loads into unified memory. First requests after a sidecar restart pay the load cost; subsequent ones run at full speed (~40ms judgments on Apple Silicon). Warm the sidecar after deployment before you care about latency.
 - **Concurrency:** Tuned for local developer-workstation agent loops — one human, one assistant, sequential requests. Large-scale multi-tenant concurrency is not yet benchmarked; treat the proxy and sidecar as single-user until measured otherwise.
-- **Fail-safe behavior:** On unhandled router or classifier sidecar errors, Bouncer fails gracefully back to the local model route (`FALLBACK_ROUTE=local`) rather than silently escalating to paid cloud APIs. A broken judge costs you speed, never money.
+- **Fail-safe behavior:** On unhandled router or classifier sidecar errors, Rovik fails gracefully back to the local model route (`FALLBACK_ROUTE=local`) rather than silently escalating to paid cloud APIs. A broken judge costs you speed, never money.
 
 ## 7. The four-model decomposition experiment
 

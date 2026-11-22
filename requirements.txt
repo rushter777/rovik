@@ -1,4 +1,4 @@
-# Bouncer — pinned, reproducible stack. Tested on Python 3.11 (macOS, Apple Silicon).
+# Rovik — pinned, reproducible stack. Tested on Python 3.11 (macOS, Apple Silicon).
 # Python >= 3.9 supported; the serving modules use `from __future__ import annotations`.
 
 # --- serving (proxy + sidecar) ---

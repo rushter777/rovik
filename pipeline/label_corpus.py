@@ -3,8 +3,8 @@
 
 Questions that passed the >=85% gate: multi_step, discovery, design, exec_verify.
 (done_open CUT at 79% agreement.) Single pass — teacher agreement proven at 92-96%.
-Teacher: any OpenAI-compatible local server (BOUNCER_TEACHER_URL, default
-http://127.0.0.1:8081/v1/chat/completions; model name via BOUNCER_TEACHER_MODEL).
+Teacher: any OpenAI-compatible local server (ROVIK_TEACHER_URL, default
+http://127.0.0.1:8081/v1/chat/completions; model name via ROVIK_TEACHER_MODEL).
 """
 
 import json
@@ -14,11 +14,11 @@ import sys
 import time
 import urllib.request
 
-API = os.environ.get("BOUNCER_TEACHER_URL", "http://127.0.0.1:8081/v1/chat/completions")
-MODEL = os.environ.get("BOUNCER_TEACHER_MODEL", "local-model")
+API = os.environ.get("ROVIK_TEACHER_URL", "http://127.0.0.1:8081/v1/chat/completions")
+MODEL = os.environ.get("ROVIK_TEACHER_MODEL", "local-model")
 DATA = sys.argv[1] if len(sys.argv) > 1 else "data/synthetic/synthetic_corpus.jsonl"
 EVAL = sys.argv[2] if len(sys.argv) > 2 else None
-OUT = os.environ.get("BOUNCER_LABEL_OUT", "data/difficulty_labels.jsonl")
+OUT = os.environ.get("ROVIK_LABEL_OUT", "data/difficulty_labels.jsonl")
 
 RUBRIC = """You are labeling a task that a user gave to an AI assistant (which has file, shell, and web tools). Answer 4 yes/no questions using ONLY the request text. Answer strictly as JSON.
 
