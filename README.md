@@ -24,6 +24,10 @@ Rovik puts an OpenAI-compatible routing switch in front of your AI apps or agent
   (free, private)  (OpenRouter / OpenAI / custom)
 ```
 
+![Rovik dashboard: route mix donut, estimated savings, and recent decisions with per-decision p_hard scores and LOCAL/ESCALATED pills.](assets/dashboard-screenshot.png)
+
+*Live dashboard served directly by the proxy at `/` (zero-config, no separate server) — showing both paths in one frame: a famous-but-simple prompt (Riemann, `p_hard 0.52` → local) and a hard multi-step debugging task (`p_hard 0.87` → escalated).*
+
 ---
 
 ## Contents
@@ -60,14 +64,14 @@ cd rovik
 python3.11 -m venv .venv
 source .venv/bin/activate
 
-# Apple Silicon (serving + MLX sidecar + PyTorch training):
+# Apple Silicon (serving + MLX sidecar + Laya runtime + PyTorch training):
 pip install -e ".[mlx,train]"
 
 # Or from the pinned requirements list:
 # pip install -r requirements.txt
 ```
 
-*(Note: `python3 -m rovik <command>` also works from the repo root without an editable install.)*
+*(Note: `.[mlx]` and `requirements.txt` include `laya-mlx` and pin `huggingface-hub>=1.31.0,<2`, verified compatible with `transformers` and training downloads. `python3 -m rovik <command>` also works from the repo root without an editable install.)*
 
 ### Configure once (`rovik init`)
 
@@ -75,7 +79,7 @@ pip install -e ".[mlx,train]"
 rovik init
 ```
 
-The wizard prompts for your local model server (llama.cpp, Ollama, LM Studio, vLLM/MLX-LM, or custom), your frontier provider/model/price, your labeling teacher, and your corpus/checkpoint paths. It writes a gitignored `rovik.env` (`0600` permissions) and never stores raw API keys in the config file. Inspect the resolved settings anytime (with secrets redacted) via:
+The wizard prompts for your local model server (llama.cpp, Ollama, LM Studio, vLLM/MLX-LM, or custom), your frontier provider/model/price, your labeling teacher, your corpus/checkpoint paths, and your preferred agent harness. It writes a gitignored `rovik.env` (`0600` permissions, without storing raw API keys), runs dependency/checkpoint preflight checks, and prints your exact parameterized copy-paste harness config. Inspect resolved settings anytime (with secrets redacted and env overrides flagged) via:
 
 ```bash
 rovik config
@@ -93,33 +97,45 @@ rovik eval --checkpoint checkpoints/cold-test --data data/synthetic/synthetic_co
 
 *(Already trained a Laya checkpoint earlier? Just point `LAYA_MODEL_PATH` in `rovik.env` at it—no retraining required.)*
 
-### Start & connect
+### Start, wire, verify
 
-Run the classifier sidecar and routing proxy in two terminals (ensure your local LLM server is also running):
+Ensure your local LLM server is running, then follow the full lifecycle (`rovik init` → `rovik start` → `rovik harness <tool>` → point your harness at the proxy → `rovik status`):
 
 ```bash
-# Terminal 1 — Laya decision sidecar (:8777)
-rovik sidecar
+# 1. Launch Laya sidecar (:8777) and Rovik proxy (:8788) in the background (logs in ROVIK_LOG_DIR)
+rovik start
 
-# Terminal 2 — Rovik OpenAI-compatible proxy (:8788)
-rovik proxy
+# 2. Print the copy-paste config for your harness (parameterized from rovik.env)
+rovik harness hermes    # or: opencode | aider | continue | generic | all
 ```
 
-Verify health, test a single prompt, and open the live savings dashboard:
+Paste the printed snippet into your agent harness so it sends OpenAI Chat Completions (`/v1/chat/completions`) to `http://127.0.0.1:8788/v1` (see [§2 Run It in Your Agent](#2-run-it-in-your-agent) for per-tool details).
 
 ```bash
-curl -s http://127.0.0.1:8788/health
+# 3. Verify health, key-source diagnostics, and any startup calibration warnings
+rovik status
+
+# Optional: test one judgment directly or open the live savings dashboard
 rovik judge "Find why the CI tests keep failing and fix the root cause"
 open http://127.0.0.1:8788/
+
+# Stop both background processes anytime
+rovik stop
 ```
 
-Point any OpenAI Chat Completions (`/v1/chat/completions`) client or agent harness at `http://127.0.0.1:8788/v1` — see [§2 Run It in Your Agent](#2-run-it-in-your-agent) for concrete configs.
+*(Need foreground terminal logs during debugging? `rovik sidecar` and `rovik proxy` still run individually in separate terminals.)*
 
 ---
 
 ## 2. Run It in Your Agent
 
 Rovik exposes `POST /v1/chat/completions` and `GET /v1/models` on `http://127.0.0.1:8788/v1` (supporting streaming SSE and tool-carrying payloads: simple tool calls stay local; hard multi-step chains escalate).
+
+**Generate parameterized snippets from your `rovik.env` anytime:** `rovik init` prints the copy-paste config for your chosen harness at the end of setup using your real `ROVIK_PROXY_PORT`, `ROVIK_LOCAL_MODEL`, and reply tags; to print one later run:
+
+```bash
+rovik harness hermes    # or: opencode | aider | continue | generic | all
+```
 
 ### Generic recipe (`/v1/chat/completions`)
 
@@ -312,11 +328,13 @@ Settings are read in order: **process environment → `rovik.env` (or `--config`
 | `LAYA_THRESH_HARD` | `0.8` | Escalate when `P(score >= 1) >= cutoff` |
 | `LAYA_CLEAR_CACHE_EVERY` | `10` | Clear MLX Metal buffer pool every N sidecar predictions (`0` disables) |
 
-**Privacy & fail-safe guarantees (see [SECURITY.md](SECURITY.md)):**
+**Privacy & fail-safe guarantees (see [SECURITY.md](SECURITY.md) & [DESIGN.md §4.1](DESIGN.md#41-the-router-servingproxypy--and-how-to-see-who-answered)):**
 - Prompts routed locally stay on loopback (`127.0.0.1`); nothing calls external APIs unless escalated.
-- API keys are never passed to the Laya sidecar and never written into `rovik.env` by `rovik init`.
+- API keys are never passed to the Laya sidecar and never written into `rovik.env` by `rovik init`. At proxy startup (`rovik start` / `rovik proxy`), Rovik logs which source supplied `ROVIK_ESC_KEYNAME` (`env` vs `env-file`, never the value) and warns if a shell-exported key or `ROVIK_*` env var overrides your config file.
 - Route tags (`[🟢 LOCAL · 35B-A3B]`, `[⚡ ESCALATED · GLM 5.3]`) are stripped from assistant history before forwarding upstream.
 - If the sidecar is stopped or times out (`2s`), Rovik falls back to `ROVIK_FALLBACK_ROUTE=local` so a broken classifier never causes silent cloud spend.
+- Escalated frontier upstream failures (for example HTTP `401`/`403` auth errors or timeouts) **fail loudly** (`502` / SSE error including the upstream response body and key-source hint) rather than silently downgrading hard requests back to local.
+- `rovik init`, `rovik start`, and `rovik sidecar` preflight `laya_mlx` (or `laya` for CPU) plus `LAYA_MODEL_PATH`, and `rovik status` surfaces any sidecar `RuntimeWarning` (such as temperature-clamping calibration notices).
 
 ---
 
@@ -332,14 +350,18 @@ For the full research story — including why subjective difficulty labels faile
 
 | Command | What it does |
 |---|---|
-| `rovik init` | Interactive wizard creating `rovik.env` |
-| `rovik config` | Print resolved config path and settings (secrets redacted) |
+| `rovik init` | Interactive wizard creating `rovik.env`, preflighting deps, and printing harness config |
+| `rovik start` | Preflight and start sidecar + proxy in background (logs & pidfiles in `ROVIK_LOG_DIR`) |
+| `rovik stop` | Stop backgrounded proxy and sidecar by pidfile or port fallback |
+| `rovik status` | Report sidecar & proxy health, key source, traffic stats, and runtime warnings |
+| `rovik harness [name]` | Print parameterized harness config (`hermes`, `opencode`, `aider`, `continue`, `generic`, `all`) |
+| `rovik config` | Print resolved config path, overrides, key source, and settings (secrets redacted) |
 | `rovik prepare-data` | Inspect, agreement-test, label, and split a raw prompt corpus |
 | `rovik train` | Fine-tune Laya with RLCD + temperature calibration |
 | `rovik eval` | Evaluate a checkpoint on held-out JSONL data |
 | `rovik sweep` | Print precision/coverage curves for `LAYA_THRESH_HARD` |
-| `rovik sidecar` | Run the Laya FastAPI MLX judgment sidecar (`:8777`) |
-| `rovik proxy` | Run the OpenAI-compatible routing proxy & dashboard (`:8788`) |
+| `rovik sidecar` | Run the Laya FastAPI MLX judgment sidecar in foreground (`:8777`) |
+| `rovik proxy` | Run the OpenAI-compatible routing proxy & dashboard in foreground (`:8788`) |
 | `rovik judge "<task>"` | Query the sidecar once and print the applied routing JSON |
 | `rovik outcomes {extract\|join}` | Extract transcript events and enrich the shadow ledger |
 
@@ -353,13 +375,17 @@ rovik/
 ├── requirements.txt                # pinned reproducible dependencies
 ├── rovik.env.example               # config template (copy or run `rovik init`)
 ├── assets/
-│   └── banner.png                  # Rovik header banner
+│   ├── banner.png                  # Rovik header banner
+│   └── dashboard-screenshot.png    # live savings dashboard screenshot
 ├── rovik/
 │   ├── __init__.py                 # package version
 │   ├── __main__.py                 # `python -m rovik` entrypoint
 │   ├── cli.py                      # unified CLI dispatcher
-│   ├── config.py                   # rovik.env parser, resolver & secret reader
-│   └── init_wizard.py              # interactive setup wizard
+│   ├── config.py                   # rovik.env parser, resolver & key/override diagnostics
+│   ├── harness.py                  # parameterized harness snippet renderer
+│   ├── init_wizard.py              # interactive setup wizard
+│   ├── preflight.py                # dependency & checkpoint preflight checks
+│   └── process.py                  # background start/stop/status lifecycle manager
 ├── pipeline/
 │   ├── prepare_corpus.py           # corpus bridge: inspect → agreement → label → split
 │   ├── agreement_test.py           # 5-axis teacher self-agreement gate (>=85%)

@@ -137,9 +137,21 @@ Two hard-won tag rules, learned from the first real session:
 1. **Tags are for the human, not the model.** The proxy strips tag lines (`[🟢 ...]`, `[⚡ ...]`, bare `🟢`/`⚡`, and exact configured tags) from assistant conversation history before forwarding upstream. Without this, the model sees tagged history, imitates the tag (double-tagging), and confabulates explanations about a routing layer it cannot see.
 2. **Never hardcode model names.** Multi-frontier setups change the escalation target per workload (`ROVIK_ESC_MODEL`); a tag that names a model goes stale the first time you swap. Icons plus a short label you control beat echoing whatever tonight's stack was.
 
+**Failure-handling policy (by failure leg):**
+
+| Failure leg | Behavior | Rationale |
+|---|---|---|
+| **Judge down / timeout (`2s`)** | Routes to `ROVIK_FALLBACK_ROUTE` (default `local`, zero client-visible error) | Classifier outages cost speed/smartness at worst, never break local availability or cause accidental cloud spend |
+| **Local upstream failure** | Escalates to frontier (`rule="local-failed-escalate"`) | If the local `llama-server` / Ollama backend restarts or errors, requests recover through Tier 2 |
+| **Frontier upstream failure (401/403, timeout, 5xx)** | **Deliberate fail-loud:** returns HTTP `502` (or SSE error event) preserving the upstream response body and non-secret key-source hint (`env` vs `env-file` conflict) | Escalated requests were explicitly flagged as too demanding for the local model (or came from `local-failed-escalate`) — silently downgrading them to local hides quality bugs, and masking HTTP 401 auth errors (such as a stale shell-exported `OPENROUTER_API_KEY`) prevents diagnosis |
+
 ### 4.2 The savings dashboard
 
 Opening the proxy root URL (`http://127.0.0.1:8788/`) serves [serving/dashboard.html](serving/dashboard.html), polling `/stats` and `/health` to display estimated savings (`local_tokens / 1e6 * ROVIK_FRONTIER_PRICE_PER_MTOK`), route mix, actual frontier spend, active fail-safe policy, and recent routing decisions. Estimates count only usage captured from upstream responses — nothing is fabricated.
+
+![Rovik dashboard: route mix donut, estimated savings, and recent decisions with per-decision p_hard scores and LOCAL/ESCALATED pills.](assets/dashboard-screenshot.png)
+
+*Served directly by `serving/proxy.py` at `/` (zero-config, no separate server) — showing both paths in one frame: a famous-but-simple prompt (Riemann, `p_hard 0.52` → local) and a hard multi-step concurrency debugging task (`p_hard 0.87` → escalated).*
 
 ### 4.3 The outcome ledger — closing the loop asynchronously
 
@@ -181,7 +193,12 @@ The joiner ([serving/outcome_joiner.py](serving/outcome_joiner.py)) is byte-offs
 - **Open problem — automated retraining:** A nightly retrain burns ~88 minutes of GPU producing an identical checkpoint when the corpus hasn't shifted. Triggering retraining only when newly enriched rows accumulate, and promoting checkpoints only after out-of-sample evaluation beats production, remains open.
 - **Cold starts & MLX memory hygiene:** Initial sidecar startup loads the checkpoint into unified memory; warmup runs automatically during FastAPI lifespan startup. Under varied-length traffic, MLX's Metal allocator pool can fragment (~43 GB cache growth over 100 varied requests measured in [eval/sidecar_memory_audit.md](eval/sidecar_memory_audit.md)); `serving/sidecar.py` clears the Metal cache every `LAYA_CLEAR_CACHE_EVERY` requests (default `10`).
 - **Concurrency:** Tuned for single-user local agent loops (requests serialized in the sidecar via `threading.Lock`).
-- **Fail-safe behavior:** Judge failures route according to `ROVIK_FALLBACK_ROUTE` (default `local`, or `escalate`). A broken judge costs speed on `local`, never accidental cloud spend.
+- **Fail-safe & upstream failure behavior:** Judge failures route according to `ROVIK_FALLBACK_ROUTE` (default `local`, zero client error). Escalated frontier upstream failures (HTTP 401/403, timeout, 5xx) deliberately fail loudly (`502` / SSE error with upstream response body + non-secret key-source diagnostics; see [§4.1](#41-the-router-servingproxypy--and-how-to-see-who-answered)).
+- **Operational preflight & runtime diagnostics:**
+  - `rovik init`, `rovik start`, and `rovik sidecar` verify that `laya_mlx` (or `laya` for CPU/PyTorch) is importable and `LAYA_MODEL_PATH` exists before starting, preventing opaque runtime `503` responses on `/predict`.
+  - Both `requirements.txt` and `pyproject.toml` pin `laya-mlx>=0.8.0` alongside `huggingface-hub>=1.31.0,<2` (verified compatible with `transformers>=5.x` and `snapshot_download`).
+  - `serving/proxy.py` logs its resolved frontier key source (`env` vs `env-file`, never values) at startup and warns when a shell environment variable shadows a different value in `ROVIK_ENV_FILE` or `rovik.env`.
+  - `serving/sidecar.py` captures `laya_mlx` / `laya` startup `RuntimeWarning`s (such as out-of-range temperature clamping calibration notices), exposes them on `/health`, and `rovik status` displays them.
 
 ### Known harness gaps & code backlog
 
