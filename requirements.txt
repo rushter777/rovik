@@ -7,6 +7,9 @@ uvicorn>=0.40.0
 pydantic>=2.12,<3
 
 # --- Laya decision model (Apple Silicon) ---
+laya-mlx>=0.8.0
+# laya-mlx requires huggingface-hub<2; verified compatible with transformers>=5.x & snapshot_download
+huggingface-hub>=1.31.0,<2
 mlx>=0.31.1
 mlx-metal>=0.31.1
 numpy>=2.0.0

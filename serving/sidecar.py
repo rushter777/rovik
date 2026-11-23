@@ -12,7 +12,9 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 import gc
 import os
+import sys
 import threading
+import warnings
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -71,6 +73,21 @@ _lock = threading.Lock()
 _agent = None
 _load_error: str | None = None
 _request_count = 0
+_startup_warnings: list[str] = []
+_backend_name: str | None = None
+
+
+def _record_warnings(caught) -> None:
+    """Capture unique warning messages from model load/warmup and log them to stderr."""
+    for w in caught or ():
+        msg = str(getattr(w, "message", w)).strip()
+        if not msg:
+            continue
+        if msg not in _startup_warnings:
+            _startup_warnings.append(msg)
+        cat = getattr(w, "category", RuntimeWarning)
+        cat_name = getattr(cat, "__name__", "Warning")
+        print(f"[laya-sidecar] {cat_name}: {msg}", file=sys.stderr, flush=True)
 
 
 def _clear_mlx_cache():
@@ -82,16 +99,54 @@ def _clear_mlx_cache():
         pass
     gc.collect()
 
-def _load_model():
-    """Load the Laya model into global _agent. Must be called under _lock."""
-    global _agent, _load_error
+
+def _import_laya_backend():
+    """Import laya_mlx (Apple Silicon MLX) first, falling back to laya (CPU/PyTorch)."""
     try:
         import laya_mlx as laya
-        _agent = laya.load(MODEL_PATH)
+        return laya, "laya_mlx"
+    except ImportError:
+        import laya
+        return laya, "laya"
+
+
+def _load_model():
+    """Load the Laya model into global _agent. Must be called under _lock."""
+    global _agent, _load_error, _startup_warnings, _backend_name
+    _startup_warnings = []
+    _backend_name = None
+    expanded = os.path.expanduser(MODEL_PATH)
+    try:
+        laya, backend = _import_laya_backend()
+        _backend_name = backend
+    except ImportError:
+        _agent = None
+        _load_error = (
+            "Neither 'laya_mlx' (Apple Silicon MLX) nor 'laya' (CPU/PyTorch) is installed. "
+            "Install with: pip install laya-mlx (requires huggingface-hub<2)."
+        )
+        print(f"[laya-sidecar] ERROR: {_load_error}", file=sys.stderr, flush=True)
+        return
+
+    if not os.path.exists(expanded):
+        _agent = None
+        _load_error = (
+            f"LAYA_MODEL_PATH does not exist: {expanded}. "
+            "Train a checkpoint with 'rovik train' or update LAYA_MODEL_PATH in rovik.env."
+        )
+        print(f"[laya-sidecar] ERROR: {_load_error}", file=sys.stderr, flush=True)
+        return
+
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", RuntimeWarning)
+            _agent = laya.load(expanded)
+        _record_warnings(caught)
         _load_error = None
     except Exception as exc:
         _agent = None
         _load_error = str(exc)
+        print(f"[laya-sidecar] ERROR: {_load_error}", file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +161,10 @@ async def lifespan(app: FastAPI):
         _load_model()
         if _agent is not None:
             try:
-                _agent.predict("warmup task", QUESTION_SET)
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always", RuntimeWarning)
+                    _agent.predict("warmup task", QUESTION_SET)
+                _record_warnings(caught)
             except Exception:
                 pass  # warm-up failure is non-fatal
     try:
@@ -122,17 +180,24 @@ app = FastAPI(title="Laya MLX Sidecar", lifespan=lifespan)
 
 @app.get("/health")
 def health():
-    """Return model load status."""
+    """Return model load status and captured startup calibration warnings."""
     if _agent is not None:
         return {
             "ok": True,
             "model": MODEL_PATH,
+            "backend": _backend_name,
             "requests": _request_count,
             "clear_cache_every": CLEAR_CACHE_EVERY,
+            "warnings": list(_startup_warnings),
         }
     return JSONResponse(
         status_code=503,
-        content={"ok": False, "model": MODEL_PATH, "error": _load_error or "model failed to load"},
+        content={
+            "ok": False,
+            "model": MODEL_PATH,
+            "error": _load_error or "model failed to load",
+            "warnings": list(_startup_warnings),
+        },
     )
 
 
@@ -166,6 +231,18 @@ def predict(payload: dict):
 
 
 def main():
+    if os.environ.get("ROVIK_SKIP_PREFLIGHT", "").strip().lower() not in ("1", "true", "yes"):
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from rovik.preflight import format_preflight, run_preflight
+
+        res = run_preflight(model_path=MODEL_PATH, check_serving=False)
+        if not res.ok:
+            print("Laya sidecar preflight failed:", file=sys.stderr)
+            print(format_preflight(res), file=sys.stderr, flush=True)
+            raise SystemExit(1)
+
     host = os.environ.get("LAYA_SIDECAR_HOST", "127.0.0.1")
     port = int(os.environ.get("LAYA_SIDECAR_PORT", "8777"))
     uvicorn.run(app, host=host, port=port)

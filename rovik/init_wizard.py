@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 
-from rovik.config import parse_env_file, write_env_file
+from rovik.config import diagnose_key_source, parse_env_file, write_env_file
+from rovik.harness import HARNESS_MENU, HARNESS_ORDER, render_harness_snippet
+from rovik.preflight import format_preflight, run_preflight
 
 LOCAL_PRESETS = {
     "1": ("llama.cpp (llama-server)", "http://127.0.0.1:8082/v1/chat/completions", "local-35b"),
@@ -34,10 +36,11 @@ def run_wizard(
     output_path: str = "rovik.env",
     *,
     non_interactive: bool = False,
+    harness: str | None = None,
     input_fn=input,
     print_fn=print,
 ) -> dict[str, str]:
-    """Prompt for local tier, frontier tier, teacher, and corpus/sidecar paths, writing rovik.env."""
+    """Prompt for local tier, frontier tier, teacher, corpus/sidecar paths, and agent harness."""
     expanded_out = os.path.expanduser(output_path)
     existing = parse_env_file(expanded_out) if os.path.isfile(expanded_out) else {}
 
@@ -52,7 +55,7 @@ def run_wizard(
     print_fn(f"Writing config to: {expanded_out}\n")
 
     # 1. Local Tier
-    print_fn("[1/4] Local Model (Tier 1 — fast/free local inference)")
+    print_fn("[1/5] Local Model (Tier 1 — fast/free local inference)")
     for k, (label, url, _) in LOCAL_PRESETS.items():
         print_fn(f"  {k}) {label} ({url})")
     cur_local_url = existing.get("ROVIK_LOCAL_URL", "")
@@ -77,7 +80,7 @@ def run_wizard(
     )
 
     # 2. Frontier Tier
-    print_fn("\n[2/4] Frontier Model (Tier 2 — selective escalation)")
+    print_fn("\n[2/5] Frontier Model (Tier 2 — selective escalation)")
     for k, (label, url, _, _, _) in FRONTIER_PRESETS.items():
         print_fn(f"  {k}) {label} ({url})")
     cur_esc_url = existing.get("ROVIK_ESC_URL", "")
@@ -114,7 +117,7 @@ def run_wizard(
     )
 
     # 3. Labeling Teacher
-    print_fn("\n[3/4] Labeling Teacher (training-time only; >=30B local or frontier API)")
+    print_fn("\n[3/5] Labeling Teacher (training-time only; >=30B local or frontier API)")
     print_fn("  1) Same as local model")
     print_fn("  2) Same as frontier model")
     print_fn("  3) Custom endpoint")
@@ -146,7 +149,7 @@ def run_wizard(
         )
 
     # 4. Data, Checkpoint & Safety
-    print_fn("\n[4/4] Corpus, Checkpoint & Routing Settings")
+    print_fn("\n[4/5] Corpus, Checkpoint & Routing Settings")
     corpus_path = _ask(
         "Default path to your raw prompt corpus (.txt/.csv/.jsonl, optional)",
         existing.get("ROVIK_CORPUS_PATH", ""),
@@ -171,6 +174,21 @@ def run_wizard(
     sidecar_host = existing.get("LAYA_SIDECAR_HOST", "127.0.0.1")
     sidecar_port = _ask("Sidecar bind port", existing.get("LAYA_SIDECAR_PORT", "8777"))
     sidecar_url = f"http://{sidecar_host}:{sidecar_port}/predict"
+
+    # 5. Agent Harness snippet selection
+    print_fn("\n[5/5] Agent Harness (prints your copy-paste config)")
+    for k, (_hkey, label) in HARNESS_MENU.items():
+        print_fn(f"  {k}) {label}")
+    if harness and harness.strip().lower() in HARNESS_ORDER:
+        selected_harness = harness.strip().lower()
+    else:
+        harness_choice = _ask("Choose agent harness", "1")
+        if harness_choice in HARNESS_MENU:
+            selected_harness = HARNESS_MENU[harness_choice][0]
+        elif harness_choice.strip().lower() in HARNESS_ORDER:
+            selected_harness = harness_choice.strip().lower()
+        else:
+            selected_harness = "hermes"
 
     values = {
         "ROVIK_LOCAL_URL": local_url,
@@ -211,11 +229,36 @@ def run_wizard(
     )
 
     print_fn(f"\nSaved Rovik configuration to {written} (mode 0600).")
-    print_fn("Next steps:")
+
+    pf = run_preflight(model_path=model_path, check_serving=True)
+    print_fn("\nPreflight check:")
+    print_fn(format_preflight(pf))
+    if esc_keyname:
+        key_diag = diagnose_key_source(esc_keyname, env_file)
+        if key_diag["warning"]:
+            print_fn(f"  [WARN] {key_diag['warning']}")
+        else:
+            print_fn(f"  [OK] Frontier key {esc_keyname}: source={key_diag['source']}")
+
+    print_fn("\nNext steps:")
+    print_fn("  1. Start Rovik (background):  rovik start")
+    print_fn(f"  2. Wire your agent harness:   paste the {selected_harness} config below")
+    print_fn("  3. Verify health & routing:   rovik status")
     if corpus_path:
-        print_fn(f"  1. Inspect your corpus: rovik prepare-data --input {corpus_path} --inspect")
+        print_fn(f"  4. (Optional) Train on corpus: rovik prepare-data --input {corpus_path} --inspect")
     else:
-        print_fn("  1. Inspect a corpus:    rovik prepare-data --input <your_prompts.jsonl> --inspect")
-    print_fn("  2. Start the sidecar:   rovik sidecar")
-    print_fn("  3. Start the proxy:     rovik proxy")
+        print_fn("  4. (Optional) Train on corpus: rovik prepare-data --input <your_prompts.jsonl> --inspect")
+
+    print_fn(f"\nCopy-paste harness configuration ({selected_harness}):")
+    print_fn(
+        render_harness_snippet(
+            selected_harness,
+            proxy_host=proxy_host,
+            proxy_port=proxy_port,
+            local_model=local_model,
+            tag_local=tag_local,
+            tag_esc=tag_esc,
+        )
+    )
+    print_fn("\nNeed another harness later? Run: rovik harness [hermes|opencode|aider|continue|generic|all]")
     return values

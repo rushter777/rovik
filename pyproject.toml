@@ -17,11 +17,14 @@ dependencies = [
 
 [project.optional-dependencies]
 mlx = [
+    "laya-mlx>=0.8.0",
+    "huggingface-hub>=1.31.0,<2",
     "mlx>=0.31.1",
     "mlx-metal>=0.31.1",
     "numpy>=2.0.0",
 ]
 train = [
+    "huggingface-hub>=1.31.0,<2",
     "torch>=2.2.0",
     "transformers>=4.48.0",
     "safetensors>=0.8.0",

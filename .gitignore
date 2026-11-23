@@ -35,4 +35,5 @@ dist/
 
 # Scratch
 *.log
+*.pid
 *.npy

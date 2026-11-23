@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -12,6 +13,7 @@ import tempfile
 import types
 import unittest
 import unittest.mock
+import urllib.error
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
@@ -29,7 +31,7 @@ def _install_fastapi_stub():
 
     class _FastAPI:
         def __init__(self, *args, **kwargs):
-            pass
+            self.lifespan = kwargs.get("lifespan")
 
         def get(self, path):
             return lambda fn: fn
@@ -93,6 +95,15 @@ class _FakeRequest:
         return self._payload
 
 
+async def _consume_streaming(resp):
+    if hasattr(resp, "body_iterator"):
+        chunks = []
+        async for part in resp.body_iterator:
+            chunks.append(part.decode("utf-8", "replace") if isinstance(part, bytes) else str(part))
+        return "".join(chunks)
+    return "".join(resp.content)
+
+
 class TestEscHeaders(unittest.TestCase):
     def test_env_precedence_over_env_file(self):
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tf:
@@ -129,6 +140,37 @@ class TestEscHeaders(unittest.TestCase):
                 unittest.mock.patch.object(proxy, "ESC_KEYNAME", "OPENROUTER_API_KEY"):
             headers = proxy._esc_headers()
         self.assertNotIn("Authorization", headers)
+
+    def test_startup_diagnostics_logs_source_conflict_and_env_overrides(self):
+        import io as _io
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_file = os.path.join(tmpdir, ".hermes.env")
+            cfg_file = os.path.join(tmpdir, "rovik.env")
+            with open(env_file, "w", encoding="utf-8") as f:
+                f.write("OPENROUTER_API_KEY=sk-good-file-secret\n")
+            with open(cfg_file, "w", encoding="utf-8") as f:
+                f.write("ROVIK_LOCAL_MODEL=from-cfg\n")
+
+            buf = _io.StringIO()
+            env_vals = {
+                "OPENROUTER_API_KEY": "sk-stale-env-secret",
+                "ROVIK_LOCAL_MODEL": "from-shell-env",
+            }
+            with unittest.mock.patch.dict(os.environ, env_vals, clear=True), \
+                    unittest.mock.patch.object(proxy, "ENV_FILE", env_file), \
+                    unittest.mock.patch.object(proxy, "ESC_KEYNAME", "OPENROUTER_API_KEY"), \
+                    unittest.mock.patch.object(proxy.rovik_config, "LOADED_CONFIG_PATH", cfg_file), \
+                    unittest.mock.patch.object(proxy.rovik_config, "ENV_OVERRIDES", {}):
+                warns = proxy.log_startup_diagnostics(stream=buf)
+
+            text = buf.getvalue()
+            self.assertIn("source=env", text)
+            self.assertIn("OPENROUTER_API_KEY in shell environment overrides", text)
+            self.assertIn("ROVIK_LOCAL_MODEL in process environment", text)
+            self.assertGreaterEqual(len(warns), 2)
+            self.assertNotIn("sk-stale-env-secret", text)
+            self.assertNotIn("sk-good-file-secret", text)
 
 
 class TestStripTags(unittest.TestCase):
@@ -186,6 +228,76 @@ class TestRouting(unittest.TestCase):
         self.assertFalse(flag)
         self.assertEqual(source, "fallback")
 
+    def test_chat_famous_but_simple_prompt_below_cutoff_stays_local(self):
+        posted_urls = []
+        logged_recs = []
+
+        def fake_judge(_task, sidecar_url=None):
+            return {
+                "tools_file": {"type": "noul", "noul": 0.04},
+                "tools_terminal": {"type": "noul", "noul": 0.02},
+                "tools_web": {"type": "noul", "noul": 0.12},
+                "needs_verification": {"type": "noul", "noul": 0.15},
+                "difficulty": {"probabilities": {"0": 0.72, "1": 0.18, "2": 0.06, "3": 0.03, "4": 0.01}},
+            }
+
+        def fake_post(url, payload, headers, timeout_s=300):
+            posted_urls.append(url)
+            return {
+                "id": "chatcmpl-riemann",
+                "choices": [{"message": {"role": "assistant", "content": "The Riemann hypothesis concerns zeros of zeta(s)."}}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 15},
+            }
+
+        req = _FakeRequest({
+            "messages": [{"role": "user", "content": "Explain the Riemann hypothesis in two sentences."}],
+            "stream": False,
+        })
+        with unittest.mock.patch.object(proxy.laya_hook, "judge", side_effect=fake_judge), \
+                unittest.mock.patch.object(proxy, "_post", side_effect=fake_post), \
+                unittest.mock.patch.object(proxy, "_log", side_effect=logged_recs.append):
+            resp = asyncio.run(proxy.chat(req))
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(posted_urls, [proxy.LOCAL_URL])
+        body = json.loads(resp.body.decode("utf-8"))
+        self.assertNotIn("error", body)
+        self.assertTrue(body["choices"][0]["message"]["content"].startswith(proxy.TAG_LOCAL))
+        self.assertEqual(logged_recs[0]["decision"], "local")
+        self.assertEqual(logged_recs[0]["routed_to"], "local")
+        self.assertAlmostEqual(logged_recs[0]["p_hard"], 0.28, places=4)
+
+    def test_chat_judge_down_falls_back_to_local_with_zero_client_error(self):
+        for mode in ("returns_none", "raises"):
+            posted_urls = []
+            logged_recs = []
+
+            def fake_post(url, payload, headers, timeout_s=300):
+                posted_urls.append(url)
+                return {
+                    "id": "chatcmpl-fallback",
+                    "choices": [{"message": {"role": "assistant", "content": "Local answer"}}],
+                }
+
+            req = _FakeRequest({"messages": [{"role": "user", "content": "Summarize this paragraph"}], "stream": False})
+            if mode == "returns_none":
+                patch_judge = unittest.mock.patch.object(proxy.laya_hook, "judge", return_value=None)
+            else:
+                patch_judge = unittest.mock.patch.object(proxy, "_judge", side_effect=RuntimeError("sidecar down"))
+
+            with patch_judge, \
+                    unittest.mock.patch.object(proxy, "FALLBACK_ROUTE", "local"), \
+                    unittest.mock.patch.object(proxy, "_post", side_effect=fake_post), \
+                    unittest.mock.patch.object(proxy, "_log", side_effect=logged_recs.append):
+                resp = asyncio.run(proxy.chat(req))
+
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(posted_urls, [proxy.LOCAL_URL])
+            body = json.loads(resp.body.decode("utf-8"))
+            self.assertNotIn("error", body)
+            self.assertTrue(body["choices"][0]["message"]["content"].startswith(proxy.TAG_LOCAL))
+            self.assertEqual(logged_recs[0]["rule"], "judge-failed-local")
+
     def test_chat_local_error_falls_back_to_escalation(self):
         posted_urls = []
         logged_recs = []
@@ -218,6 +330,92 @@ class TestRouting(unittest.TestCase):
         self.assertEqual(rec["rule"], "local-failed-escalate")
         self.assertEqual(rec["upstream"], ["esc", proxy.ESC_URL])
 
+    def test_chat_frontier_401_fails_loudly_with_upstream_body_and_key_hint(self):
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tf:
+            tf.write('OPENROUTER_API_KEY="sk-good-file-secret"\n')
+            env_path = tf.name
+        logged_recs = []
+
+        def fake_urlopen(req, timeout=300):
+            raise urllib.error.HTTPError(
+                proxy.ESC_URL,
+                401,
+                "Unauthorized",
+                {},
+                io.BytesIO(b'{"error":{"message":"User not found.","code":401}}'),
+            )
+
+        try:
+            req = _FakeRequest({"messages": [{"role": "user", "content": "Design distributed consensus"}], "stream": False})
+            with unittest.mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-stale-env-secret"}, clear=True), \
+                    unittest.mock.patch.object(proxy, "ENV_FILE", env_path), \
+                    unittest.mock.patch.object(proxy, "ESC_KEYNAME", "OPENROUTER_API_KEY"), \
+                    unittest.mock.patch.object(proxy, "_judge", return_value=(0.95, True, "laya")), \
+                    unittest.mock.patch.object(proxy.urllib.request, "urlopen", side_effect=fake_urlopen), \
+                    unittest.mock.patch.object(proxy, "_log", side_effect=logged_recs.append):
+                resp = asyncio.run(proxy.chat(req))
+        finally:
+            os.unlink(env_path)
+
+        self.assertEqual(resp.status_code, 502)
+        body = json.loads(resp.body.decode("utf-8"))
+        msg = body["error"]["message"]
+        self.assertIn("HTTP Error 401: Unauthorized", msg)
+        self.assertIn("User not found.", msg)
+        self.assertIn("loaded from env; differs from", msg)
+        self.assertNotIn("sk-stale-env-secret", msg)
+        self.assertNotIn("sk-good-file-secret", msg)
+        self.assertEqual(logged_recs[0]["upstream"], ["esc", proxy.ESC_URL])
+        self.assertIn("User not found.", logged_recs[0]["error"])
+
+    def test_chat_frontier_timeout_fails_loudly(self):
+        posted_urls = []
+        logged_recs = []
+
+        def fake_post(url, payload, headers, timeout_s=300):
+            posted_urls.append(url)
+            raise TimeoutError("frontier timed out")
+
+        req = _FakeRequest({"messages": [{"role": "user", "content": "Hard multi-step refactor"}], "stream": False})
+        with unittest.mock.patch.object(proxy, "_judge", return_value=(0.95, True, "laya")), \
+                unittest.mock.patch.object(proxy, "_post", side_effect=fake_post), \
+                unittest.mock.patch.object(proxy, "_log", side_effect=logged_recs.append), \
+                unittest.mock.patch.object(proxy, "_esc_headers", return_value={"Content-Type": "application/json"}):
+            resp = asyncio.run(proxy.chat(req))
+
+        self.assertEqual(resp.status_code, 502)
+        self.assertEqual(posted_urls, [proxy.ESC_URL])
+        body = json.loads(resp.body.decode("utf-8"))
+        self.assertIn("frontier timed out", body["error"]["message"])
+        self.assertIn("frontier timed out", logged_recs[0]["error"])
+
+    def test_chat_streaming_frontier_401_emits_upstream_body_in_sse_error(self):
+        logged_recs = []
+
+        def fake_urlopen(req, timeout=600):
+            raise urllib.error.HTTPError(
+                proxy.ESC_URL,
+                401,
+                "Unauthorized",
+                {},
+                io.BytesIO(b'{"error":{"message":"User not found."}}'),
+            )
+
+        req = _FakeRequest({"messages": [{"role": "user", "content": "Hard streaming task"}], "stream": True})
+        with unittest.mock.patch.dict(os.environ, {}, clear=True), \
+                unittest.mock.patch.object(proxy, "ENV_FILE", "/nonexistent/.env"), \
+                unittest.mock.patch.object(proxy, "_judge", return_value=(0.95, True, "laya")), \
+                unittest.mock.patch.object(proxy.urllib.request, "urlopen", side_effect=fake_urlopen), \
+                unittest.mock.patch.object(proxy, "_log", side_effect=logged_recs.append):
+            resp = asyncio.run(proxy.chat(req))
+            stream_out = asyncio.run(_consume_streaming(resp))
+
+        self.assertIn("User not found.", stream_out)
+        self.assertIn("source: missing", stream_out)
+        self.assertIn("data: [DONE]", stream_out)
+        self.assertEqual(len(logged_recs), 1)
+        self.assertIn("User not found.", logged_recs[0]["error"])
+
 
 class TestLogPaths(unittest.TestCase):
     def test_default_and_override_log_file(self):
@@ -241,6 +439,10 @@ class TestEndpoints(unittest.TestCase):
         self.assertTrue(health["ok"])
         self.assertEqual(health["proxy"], "rovik")
         self.assertIn("fallback_route", health)
+        self.assertEqual(health["esc_failure_policy"], "fail-loud")
+        self.assertIn("esc_key", health)
+        self.assertNotIn("value", health["esc_key"])
+        self.assertIsInstance(health["warnings"], list)
 
         resp = proxy.dashboard()
         self.assertEqual(resp.status_code, 200)

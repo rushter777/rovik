@@ -14,8 +14,12 @@ Every answer is tagged so the human always knows who answered:
     [🟢 LOCAL · 35B-A3B]   or   [⚡ ESCALATED · GLM 5.3]
 Every decision is logged to data/proxy_log.jsonl (ROVIK_LOG_DIR to override).
 
-Fail-safe: judge failures follow ROVIK_FALLBACK_ROUTE (default 'local', or
-'escalate'). Local upstream failures fall back to escalation.
+Fail-safe matrix:
+    - Judge unavailable / timeout -> ROVIK_FALLBACK_ROUTE (default 'local', or 'escalate').
+    - Local upstream error          -> escalate to frontier (rule='local-failed-escalate').
+    - Frontier upstream error       -> deliberate FAIL-LOUD (HTTP 502 / SSE error event
+      with upstream status, body, and non-secret key-source diagnostics; never silently
+      downgrades an escalated request to local or masks auth misconfigurations).
 
 Env:
     ROVIK_PROXY_HOST            (default 127.0.0.1)
@@ -37,6 +41,7 @@ Env:
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import copy
 import hashlib
 import json
@@ -44,16 +49,24 @@ import os
 import re
 import sys
 import time
-import uuid
+import urllib.error
 import urllib.request
+import uuid
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from rovik import config as rovik_config  # noqa: E402
+
 try:
     from serving import hook as laya_hook
 except ImportError:
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, _HERE)
     import hook as laya_hook
 
 PROXY_PORT = int(os.environ.get("ROVIK_PROXY_PORT", "8788"))
@@ -87,39 +100,156 @@ LOG_FILE = os.path.join(LOG_DIR, "proxy_log.jsonl")
 TAG_LOCAL = os.environ.get("ROVIK_TAG_LOCAL", "[🟢 LOCAL · 35B-A3B]")
 TAG_ESC = os.environ.get("ROVIK_TAG_ESC", "[⚡ ESCALATED · GLM 5.3]")
 
-app = FastAPI()
+ESC_FAILURE_POLICY = "fail-loud"
+
+
+class UpstreamHTTPError(RuntimeError):
+    """Upstream HTTP error carrying status code and sanitized upstream error body."""
+
+    def __init__(self, status: int, message: str, body: str = "") -> None:
+        super().__init__(message)
+        self.status = status
+        self.body = body
+
+
+def _read_http_error_body(exc: urllib.error.HTTPError, limit: int = 500) -> str:
+    """Safely extract and compact an HTTPError response body up to *limit* chars."""
+    try:
+        raw = exc.read()
+    except Exception:
+        return ""
+    if not raw:
+        return ""
+    if isinstance(raw, (bytes, bytearray)):
+        text = raw.decode("utf-8", "replace")
+    else:
+        text = str(raw)
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
+
+
+def _auth_key_hint(key_info: dict | None) -> str:
+    """Return non-secret key-source context for 401/403 escalation errors."""
+    if not key_info:
+        return ""
+    key_name = key_info.get("key_name") or ESC_KEYNAME
+    if key_info.get("conflict"):
+        return f" [key {key_name} loaded from env; differs from {key_info.get('env_file')}]"
+    return f" [key {key_name} source: {key_info.get('source', 'unknown')}]"
+
+
+def _format_http_error(
+    exc: urllib.error.HTTPError,
+    *,
+    key_info: dict | None = None,
+    body: str | None = None,
+) -> str:
+    """Format HTTP status, reason, upstream response body, and auth key source."""
+    err_body = _read_http_error_body(exc) if body is None else body
+    msg = f"HTTP Error {exc.code}: {exc.reason}"
+    if err_body:
+        msg = f"{msg} — {err_body}"
+    if exc.code in (401, 403) and key_info:
+        msg = f"{msg}{_auth_key_hint(key_info)}"
+    return msg
+
+
+def _esc_key_info() -> dict:
+    """Resolve frontier key source using current module globals ESC_KEYNAME / ENV_FILE."""
+    return rovik_config.diagnose_key_source(ESC_KEYNAME, ENV_FILE)
 
 
 def _esc_headers():
-    """Read ESC_KEYNAME from os.environ first, falling back to ROVIK_ENV_FILE (default ~/.hermes/.env). Never printed."""
+    """Read ESC_KEYNAME from os.environ first, falling back to ROVIK_ENV_FILE. Never printed."""
     headers = {"Content-Type": "application/json"}
-    api_key = os.environ.get(ESC_KEYNAME, "").strip()
-    if not api_key and ENV_FILE:
-        env_path = os.path.expanduser(ENV_FILE)
-        if os.path.exists(env_path):
-            with open(env_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    raw = line.strip()
-                    if not raw or raw.startswith("#"):
-                        continue
-                    if raw.startswith("export "):
-                        raw = raw[len("export "):].lstrip()
-                    if raw.startswith(ESC_KEYNAME + "="):
-                        val = raw.split("=", 1)[1].strip()
-                        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
-                            val = val[1:-1]
-                        api_key = val
-                        break
+    api_key = _esc_key_info()["value"]
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     return headers
 
 
+def _collect_startup_diagnostics() -> tuple[dict, list[str]]:
+    """Summarize frontier key source (never secret value) and active env override warnings."""
+    info = _esc_key_info()
+    key_summary = {
+        "name": info["key_name"],
+        "source": info["source"],
+        "env_file": info["env_file"],
+        "conflict": info["conflict"],
+    }
+    warnings_list: list[str] = []
+    if info["warning"]:
+        warnings_list.append(info["warning"])
+
+    seen_keys: set[str] = set()
+    for item in rovik_config.detect_env_overrides():
+        k = item["key"]
+        if not (k.startswith("ROVIK_") or k.startswith("LAYA_")):
+            continue
+        seen_keys.add(k)
+        warnings_list.append(item["warning"])
+
+    if rovik_config.LOADED_CONFIG_PATH:
+        for k, (env_val, file_val) in rovik_config.ENV_OVERRIDES.items():
+            if k in seen_keys or not (k.startswith("ROVIK_") or k.startswith("LAYA_")):
+                continue
+            if rovik_config.is_secret_key(k):
+                warnings_list.append(
+                    f"{k} in process environment overrides a different value in "
+                    f"{rovik_config.LOADED_CONFIG_PATH} (values redacted)."
+                )
+            else:
+                warnings_list.append(
+                    f"{k} in process environment ({env_val!r}) overrides "
+                    f"{rovik_config.LOADED_CONFIG_PATH} ({file_val!r})"
+                )
+    return key_summary, warnings_list
+
+
+def log_startup_diagnostics(stream=None) -> list[str]:
+    """Log frontier key source and env-override warnings at startup (never prints key values)."""
+    out = sys.stderr if stream is None else stream
+    key_summary, warnings_list = _collect_startup_diagnostics()
+    src_detail = key_summary["source"]
+    if src_detail == "env-file" and key_summary["env_file"]:
+        src_detail = f"env-file ({key_summary['env_file']})"
+    print(f"[rovik-proxy] Frontier key {key_summary['name']}: source={src_detail}", file=out)
+    for warn in warnings_list:
+        print(f"[rovik-proxy] WARNING: {warn}", file=out)
+    if hasattr(out, "flush"):
+        out.flush()
+    return warnings_list
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Emit key-source and environment override diagnostics on proxy startup."""
+    log_startup_diagnostics()
+    yield
+
+
+app = FastAPI(title="Rovik Proxy", lifespan=lifespan)
+
+
 def _post(url, payload, headers, timeout_s=300):
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(), headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout_s) as r:
-        return json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as exc:
+        try:
+            body = _read_http_error_body(exc)
+            msg = _format_http_error(exc, body=body)
+            code = exc.code
+        finally:
+            try:
+                exc.close()
+            except Exception:
+                pass
+        raise UpstreamHTTPError(code, msg, body=body) from exc
 
 
 def _latest_user_text(messages):
@@ -252,12 +382,16 @@ def _log(rec):
 
 @app.get("/health")
 def health():
+    key_summary, warnings_list = _collect_startup_diagnostics()
     return {
         "ok": True,
         "proxy": "rovik",
         "local": LOCAL_URL,
         "judge": JUDGE_URL,
         "fallback_route": FALLBACK_ROUTE,
+        "esc_failure_policy": ESC_FAILURE_POLICY,
+        "esc_key": key_summary,
+        "warnings": warnings_list,
     }
 
 
@@ -297,6 +431,7 @@ async def chat(request: Request):
 
         # 1. Route (local + local-harness both go to the 35B, tools forwarded)
         upstream = None
+        esc_key_info = None
         if decision in ("local", "local-harness"):
             try:
                 local_payload = _strip_tags_from_history(dict(payload))
@@ -337,6 +472,7 @@ async def chat(request: Request):
             esc_payload.pop("chat_template_kwargs", None)  # llama-server-specific
             # Thread outcome-capture key into the escalation request too.
             _thread_decision_id(esc_payload, decision_id)
+            esc_key_info = _esc_key_info()
             upstream = ("esc", ESC_URL, esc_payload, _esc_headers())
             rec["answered_by"] = "session-model"
 
@@ -372,7 +508,21 @@ async def chat(request: Request):
                                     except ValueError:
                                         pass
                             yield s
+                except urllib.error.HTTPError as exc:
+                    try:
+                        msg = _format_http_error(exc, key_info=esc_key_info if kind == "esc" else None)
+                    finally:
+                        try:
+                            exc.close()
+                        except Exception:
+                            pass
+                    rec["error"] = msg[:500]
+                    err = json.dumps({"error": {"message": f"rovik relay failure: {msg}",
+                                                "type": "proxy_error"}})
+                    yield f"data: {err}\n\n"
+                    yield "data: [DONE]\n\n"
                 except Exception as e:
+                    rec["error"] = str(e)[:500]
                     err = json.dumps({"error": {"message": f"rovik relay failure: {e}",
                                                 "type": "proxy_error"}})
                     yield f"data: {err}\n\n"
@@ -385,7 +535,25 @@ async def chat(request: Request):
                                               "X-Accel-Buffering": "no"})
 
         # 3b. Non-streaming escalation
-        resp = _post(up_url, up_payload, up_headers, 600)
+        try:
+            resp = _post(up_url, up_payload, up_headers, 600)
+        except UpstreamHTTPError as exc:
+            msg = str(exc)
+            if kind == "esc" and exc.status in (401, 403):
+                msg = f"{msg}{_auth_key_hint(esc_key_info)}"
+            raise UpstreamHTTPError(exc.status, msg, body=exc.body) from exc
+        except urllib.error.HTTPError as exc:
+            try:
+                body = _read_http_error_body(exc)
+                msg = _format_http_error(exc, key_info=esc_key_info if kind == "esc" else None, body=body)
+                code = exc.code
+            finally:
+                try:
+                    exc.close()
+                except Exception:
+                    pass
+            raise UpstreamHTTPError(code, msg, body=body) from exc
+
         if tag:
             content = resp["choices"][0]["message"].get("content") or ""
             resp["choices"][0]["message"]["content"] = f"{tag}\n{content}"
@@ -395,8 +563,8 @@ async def chat(request: Request):
         return JSONResponse(resp)
 
     except Exception as e:
-        # Fail-safe: log and re-raise as 502 so the caller's own fallback kicks in.
-        rec["error"] = str(e)[:200]
+        # Deliberate fail-loud on escalation/upstream failures (HTTP 502) so auth or provider errors surface cleanly.
+        rec["error"] = str(e)[:500]
         _log(rec)
         return JSONResponse({"error": {"message": f"rovik proxy failure: {e}"}},
                             status_code=502)
