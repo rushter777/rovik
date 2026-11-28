@@ -346,8 +346,8 @@ def main():
             # MPS allocator hygiene: heterogeneous batch shapes make the private
             # pool grow unboundedly without periodic release (leak seen on v3 data)
             del eps, z, q, r, adv, logp, loss_rl, loss_ce, loss, logits, act
-            if b_idx % (MICRO_BATCH * 10) == 0:
-                torch.mps.empty_cache()
+            if b_idx % (MICRO_BATCH * 10) == 0 and torch.backends.mps.is_available():
+                torch.mps.empty_cache()  # MPS-only allocator release; crashes on CPU backend
 
             if accum_step % GRAD_ACCUM == 0 or (b_idx + MICRO_BATCH) >= len(items):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)

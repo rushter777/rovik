@@ -85,6 +85,31 @@ self-contained. Bring your own trained checkpoint by dropping it into the
 - Preflight skip also skips checkpoint sanity checks — run
   `python -m rovik config` inside the container if you want the look.
 
+## Verified findings (real CPU-container build, 2026-11-28)
+
+A third-party deployment on a Windows laptop (i7-13700 / RTX 3060, Docker
+Desktop) exercised the first real build of this recipe. Three fixes landed
+from that run — treat these as build-verified, unlike the rest of this draft:
+
+1. **`.dockerignore` must NOT exclude `data/`** — the entrypoint needs
+   `data/synthetic/` for the first-boot toy checkpoint, and `COPY data ./data`
+   fails the build if the directory is ignored. Only live artifacts
+   (`data/*.log`, `data/*.pid`, `data/proxy_log.jsonl`, `data/*.json`) stay out.
+2. **`pipeline/train_rlcd.py` called `torch.mps.empty_cache()` unguarded** —
+   a hard crash on any CPU-only backend ("Cannot execute emptyCache() without
+   MPS backend"). Now guarded behind `torch.backends.mps.is_available()`.
+   The toy-smoke-run in a CPU container doubles as the cross-platform
+   regression test for this.
+3. **`/app/checkpoints` must exist and be `rovik`-owned in the image** —
+   Docker initializes an empty named volume with the image mount point's
+   ownership; without the `mkdir + chown` the volume mounts root-owned and
+   first-boot training dies with `PermissionError`, restart-looping the
+   container.
+
+Also confirmed environmental, no code change: host port 8788 may conflict
+(`ROVIK_PORT=18788` worked), and a stale same-name container blocks
+`docker compose up -d` until removed.
+
 ## Smoke test (once on real hardware)
 
 ```bash

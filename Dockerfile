@@ -50,7 +50,13 @@ RUN python -m pip install '.[train]' \
 COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 # Non-root: a routing proxy reachable from other containers should not own uid 0.
+# /app/checkpoints must EXIST and be owned by rovik BEFORE the named volume
+# mounts over it: Docker initializes an empty named volume with the image
+# mount point's ownership, so without this the volume comes up root-owned and
+# first-boot checkpoint training dies with PermissionError (found in a real
+# CPU-container build, 2026-11-28).
 RUN useradd --create-home --uid 1000 rovik \
+ && mkdir -p /app/checkpoints /app/data \
  && chown -R rovik:rovik /app
 USER rovik
 

@@ -1,7 +1,12 @@
 .git
 .gitignore
 .venv
-data
+# data/ IS shipped in the image: docker-entrypoint.sh needs data/synthetic/
+# for the first-boot toy checkpoint. Only live runtime artifacts stay out.
+data/*.log
+data/*.pid
+data/proxy_log.jsonl
+data/*.json
 eval
 tests
 examples
