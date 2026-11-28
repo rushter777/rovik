@@ -1,0 +1,14 @@
+.git
+.gitignore
+.venv
+data
+eval
+tests
+examples
+assets
+checkpoints
+*.log
+*.pid
+rovik.env
+__pycache__
+*.pyc
