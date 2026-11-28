@@ -5,56 +5,85 @@ was deliberately purged from that machine). The first person to `docker compose
 up` on a real host owns the verification pass; until then, treat every command
 below as a best-evidence draft, not a receipt.
 
-## Why Docker
+## Why Docker, and why ONE container
 
-The container replaces `rovik start/stop/status` — the lifecycle manager depends
-on `lsof`, `ps`, and SIGTERM pidfiles and is macOS/WSL-shaped. Inside a container
-you don't need it: the container *is* the process manager. The base package
-(`fastapi`, `uvicorn`, `pydantic`) is pure Python, so containerizing makes Rovik
-run anywhere Docker runs — including a friend's Windows laptop with zero code
-changes to the routing layer.
+The base package (`fastapi`, `uvicorn`, `pydantic`) is pure Python, so a
+container makes Rovik run anywhere Docker runs — including a Windows laptop
+with zero code changes to the routing layer. The `rovik start/stop/status`
+lifecycle manager (lsof/ps/SIGTERM pidfiles) also runs unmodified inside
+Linux, so we use it: **one container runs the whole managed lifecycle**, with
+sidecar (:8777) and proxy (:8788) as children of `docker-entrypoint.sh`.
+
+Single-container is deliberate:
+
+- the repo's **loopback defaults become correct** — the judge URL
+  (`http://127.0.0.1:8777/predict`) just works, no cross-container networking;
+- no `depends_on`, no service-name DNS for the proxy→sidecar hop;
+- only the proxy is published; the sidecar never leaves container loopback.
 
 ## Shape
 
 ```
-docker compose up -d          # builds rovik:latest, starts sidecar + proxy
+docker compose up -d          # builds rovik:latest
 
-rovik-sidecar   :  python -m rovik sidecar   (Laya CPU, :8777, 0.0.0.0)
-rovik           :  python -m rovik proxy     (:8788, 0.0.0.0, published)
+rovik (one container)
+  ├─ python -m rovik sidecar   (Laya CPU backend, 127.0.0.1:8777)
+  └─ python -m rovik proxy     (0.0.0.0:8788, published)
 ```
 
-Agent harnesses on the same compose network use `http://rovik:8788/v1`.
-Harness containers *outside* this compose file need to join the network or use
-the published host port.
+Agent harnesses on the same docker network use `http://rovik:8788/v1`.
+Harness containers *outside* this compose file need to join the network
+(`ROVIK_NETWORK`) or use the published host port.
 
 ## Non-negotiables (the traps)
 
-1. **`ROVIK_PROXY_HOST=0.0.0.0` and `LAYA_SIDECAR_HOST=0.0.0.0`.** The defaults
-   are loopback; a loopback bind inside a container is unreachable from any
-   other container. Symptom: instant `connection refused`.
-2. **`ROVIK_JUDGE_URL=http://rovik-sidecar:8777/predict`** — the proxy must reach
-   the sidecar by service name, not 127.0.0.1, for exactly the same reason.
-3. **The local LLM stays on the host** (keep the GPU out of the container).
-   `ROVIK_LOCAL_URL=http://host.docker.internal:8081/...` bridges back out.
-   On the author's Mac the local model is llama-server on :8081; on Windows
-   the same shape holds for llama.cpp / Ollama / LM Studio.
-4. **`ROVIK_FALLBACK_ROUTE=local` and lower `LAYA_THRESH_HARD`** for small
-   local models (0.5–0.6, per the main README §Three Model Roles).
-5. **Secrets stay out of the image.** API keys come via env / env_file at
-   runtime; nothing is baked into a layer. Do not commit a `rovik.env` with a key.
+1. **`ROVIK_PROXY_HOST=0.0.0.0`** — a loopback bind inside a container is
+   unreachable from every other container and from the host. Symptom: instant
+   `connection refused`. The **sidecar** stays on `127.0.0.1`: only the proxy
+   (same container) talks to it.
+2. **`ROVIK_SKIP_PREFLIGHT=1`** — `rovik start` preflights the local LLM and
+   checkpoint, which is boot-order fragile against sibling containers (Ollama
+   may still be restarting). Skip it; `ROVIK_FALLBACK_ROUTE=local` makes
+   routing fail loud and free instead.
+3. **CPU torch before `.[train]`** — `pip install --index-url
+   https://download.pytorch.org/whl/cpu torch` FIRST, or pip resolves the CUDA
+   build and the image balloons by gigabytes the CPU can never use.
+4. **`laya` (CPU backend), never `.[mlx]` off Apple Silicon** — MLX does not
+   build on Linux/Windows. `laya>=0.5.5` is verified on PyPI (0.5.6, Apache-2.0,
+   Python ≥3.10).
+5. **`lsof` + `procps` in the image** — python:3.11-slim lacks them and rovik
+   degrades silently: `stop` still works (real pids, SIGTERM) but port-conflict
+   detection and `--force-port` are dead. `apt-get install` lights them up.
+6. **`ROVIK_FALLBACK_ROUTE=local`** (default, set it explicitly anyway) — Laya
+   or local-model failure must never escalate to the paid tier.
+7. **Lower `LAYA_THRESH_HARD` for small local models** — 0.5–0.6 for a 7B,
+   per the main README §Three Model Roles; 0.8 is for a 35B.
+8. **Secrets stay out of the image** — keys arrive via runtime env /
+   `env_file` (`rovik.docker.env`, gitignored, `required: false`); nothing is
+   baked into a layer, no key is ever committed.
+9. **Copy `pipeline/`** — `rovik train/eval/sweep` imports it at runtime.
 
-## Open questions (verify before trusting)
+## First boot
 
-- **CPU Laya package availability.** `rovik/preflight.py` names two backends:
-  `laya_mlx` (Apple) and `laya` (CPU/PyTorch). The Dockerfile assumes `pip install laya`
-  works. If `laya` is not published (wheel/local only), fix the Dockerfile before
-  the first build.
-- **Checkpoint mount.** `LAYA_MODEL_PATH=/checkpoints/laya` assumes the MLX
-  checkpoint directory loads as-is under the CPU backend. If the CPU backend
-  needs a different export format, the compose volume/mount changes — verify.
-- **Preflight is skipped** (`ROVIK_SKIP_PREFLIGHT=1`) because it probes things
-  the container can't see. That also skips checkpoint sanity checks — run
-  `python -m rovik config` once inside the container if you want a look.
+`docker-entrypoint.sh` checks `LAYA_MODEL_PATH`; if the mounted volume has no
+checkpoint yet, it builds the documented synthetic toy checkpoint (README
+"1-minute smoke run": `generate.py` → train → eval) so the container is fully
+self-contained. Bring your own trained checkpoint by dropping it into the
+`rovik-checkpoints` volume and pointing `LAYA_MODEL_PATH` at it.
+
+## Open questions (verify on real hardware)
+
+- **Checkpoint format under the CPU backend.** The `laya` PyPI package loads
+  classic-encoder checkpoints from the HF Hub (`convaiinnovations/laya`).
+  Whether a local `LAYA_MODEL_PATH` checkpoint directory (as produced by
+  `pipeline/train_rlcd.py` / the MLX path) loads as-is under the CPU backend
+  — or needs an export/Hub-id step — is unverified. First boot's synthetic
+  train answers it empirically: if that works, your own checkpoint in the same
+  format works.
+- **`rovik start --no-wait`** — the flag exists in `start_services(wait=False)`;
+  confirm the CLI spelling on the first real run.
+- Preflight skip also skips checkpoint sanity checks — run
+  `python -m rovik config` inside the container if you want the look.
 
 ## Smoke test (once on real hardware)
 
@@ -65,8 +94,18 @@ docker compose exec rovik python -m rovik status || true
 curl -s http://localhost:8788/ | head        # dashboard
 curl -s http://localhost:8788/v1/chat/completions -H 'content-type: application/json' \
   -d '{"model":"rovik","messages":[{"role":"user","content":"hi"}]}'
-docker compose logs rovik rovik-sidecar | tail -50
+docker compose logs rovik | tail -50
 ```
 
-Expect the LOCAL tag on trivial prompts and no frontier traffic unless a
-hard prompt crosses `LAYA_THRESH_HARD`.
+Expect the LOCAL tag on trivial prompts and no frontier traffic unless a hard
+prompt crosses `LAYA_THRESH_HARD`. The dashboard at `/` shows route mix,
+savings, and per-decision p_hard.
+
+## Windows notes
+
+Docker Desktop on Windows runs all of this on WSL2 with no code changes.
+There is nothing Mac-specific in the container: CPU torch, `laya` CPU backend,
+pure-Python proxy. A local LLM on the Windows host is reached with
+`ROVIK_LOCAL_URL=http://host.docker.internal:<port>/...` (Docker Desktop
+defines that name natively); a GPU (6GB-class) stays with the host LLM, never
+inside this container.

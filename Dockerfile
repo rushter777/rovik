@@ -1,46 +1,60 @@
-# Rovik in a container — proxy (:8788) + Laya CPU sidecar (:8777).
+# Rovik in a container — ONE container running the managed lifecycle:
+# proxy (:8788) + Laya CPU sidecar (:8777) as children of docker-entrypoint.sh.
 #
-# UNTESTED AS OF WRITING (2026-11-28): authored on macOS, which has no Docker.
-# First build/run must be verified on a real Docker host before this ships.
-# See docs/docker.md for the full recipe and open questions.
+# UNTESTED AS OF WRITING (2026-11-28): authored on macOS, which has no Docker
+# (deliberately purged). First build/run must be verified on a real Docker
+# host. See docs/docker.md.
 #
-# Design notes:
-# - CPU PyTorch only: the container routes; it does not need GPU. Keep the
-#   local LLM (and its GPU) on the host and point ROVIK_LOCAL_URL at it.
-# - `laya-mlx` is Apple-only and NOT installed here; the `laya` CPU/PyTorch
-#   backend serves /predict instead. Same checkpoints, same thresholds.
-# - The `rovik start/stop/status` lifecycle manager is deliberately unused:
-#   it depends on lsof/ps/SIGTERM and pidfiles. The container *is* the
-#   process manager.
+# Design (single container — see docs/docker.md and rovik-router-ops):
+# - Both services in ONE container => the repo's loopback defaults become
+#   CORRECT (judge URL http://127.0.0.1:8777, no cross-container networking).
+# - `rovik start/stop` runs unmodified; the entrypoint traps SIGTERM and
+#   forwards it. `lsof`/`ps` are installed so rovik's port-conflict
+#   detection and `--force-port` actually work (python:3.11-slim lacks them
+#   and rovik degrades silently without).
+# - CPU-only torch FIRST so `.[train]`'s torch>=2.2 can't pull CUDA builds
+#   (multi-GB of wheels this CPU container can never use).
+# - `laya` PyPI package = CPU backend (v0.5.6 verified on PyPI, Apache-2.0,
+#   py>=3.10). `.[mlx]` is Apple-only and must NOT appear here.
+# - `pipeline/` is copied: `rovik train/eval/sweep` imports it at runtime.
+# - No secrets in any layer: keys arrive via runtime env / env_file only.
 
 FROM python:3.11-slim
 
-ENV PYTHONUNBUFFERED=1 \
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    OMP_NUM_THREADS=4
+
+# lsof/procps: rovik lifecycle port-conflict detection + --force-port.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends lsof procps \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Torch CPU first (big, rarely-changing layer) — keeps rebuilds cheap.
-RUN pip install --index-url https://download.pytorch.org/whl/cpu \
-        torch>=2.2.0
+# CPU-only PyTorch BEFORE anything that requires torch>=2.2.
+RUN python -m pip install --upgrade pip \
+ && python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
 
-# Runtime deps: base package + CPU Laya backend + hub for checkpoint loading.
 COPY pyproject.toml README.md ./
-COPY rovik/ rovik/
-COPY serving/ serving/
-RUN pip install --no-deps -e . \
-    && pip install fastapi uvicorn "pydantic>=2.12,<3" \
-        "huggingface-hub>=1.31.0,<2" transformers safetensors numpy
+COPY rovik ./rovik
+COPY serving ./serving
+COPY pipeline ./pipeline
+COPY data ./data
 
-# UNVERIFIED: the CPU Laya inference package (`laya`, per rovik/preflight.py).
-# pip install laya   <- confirmed available? If it is local/wheel-only,
-# drop the wheel here or COPY the package source before this line.
+RUN python -m pip install '.[train]' \
+ && python -m pip install 'laya>=0.5.5'
 
-# Non-root.
-RUN useradd --create-home --uid 1000 rovik
+COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+
+# Non-root: a routing proxy reachable from other containers should not own uid 0.
+RUN useradd --create-home --uid 1000 rovik \
+ && chown -R rovik:rovik /app
 USER rovik
 
-# Ports: proxy (8788) and sidecar (8777). Both bind 0.0.0.0 via env in
-# docker-compose.yml — a loopback bind inside a container is unreachable.
-EXPOSE 8788 8777
+# Only the proxy is published; the sidecar stays on container loopback.
+EXPOSE 8788
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

@@ -1,51 +1,68 @@
-# Two-container Rovik: proxy (:8788) + Laya CPU sidecar (:8777).
-#
+# Rovik in Docker — ONE container running the managed lifecycle.
 # UNTESTED (2026-11-28) — authored on a Docker-less mac. See docs/docker.md.
-# Agent harnesses (e.g. a Hermes container on the same network) point at:
+#
+# Harnesses (e.g. a Hermes container) on the same network use:
 #     http://rovik:8788/v1
+# The proxy is also published to the host port for native clients.
 
 services:
-
-  rovik-sidecar:
-    build: .
-    image: rovik:latest
-    command: python -m rovik sidecar
-    restart: unless-stopped
-    environment:
-      ROVIK_SKIP_PREFLIGHT: "1"          # container can't see the host LLM
-      LAYA_SIDECAR_HOST: 0.0.0.0          # loopback bind = unreachable in Docker
-      LAYA_SIDECAR_PORT: "8777"
-      LAYA_MODEL_PATH: /checkpoints/laya  # mount your real checkpoint dir below
-    volumes:
-      - ./checkpoints:/checkpoints:ro
-
   rovik:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: rovik:latest
-    command: python -m rovik proxy
+    container_name: rovik
     restart: unless-stopped
-    depends_on:
-      - rovik-sidecar
-    ports:
-      - "8788:8788"                        # optional: expose to host
+    env_file:
+      - path: ./rovik.docker.env
+        required: false            # secrets (OPENROUTER_API_KEY etc.) — never committed
     environment:
+      # Container is the process manager; preflight would probe siblings
+      # (Ollama) that may be down at boot — fail loud at routing instead.
       ROVIK_SKIP_PREFLIGHT: "1"
+      # Proxy must bind 0.0.0.0 to be reachable from other containers/host.
+      # The sidecar does NOT (only the proxy, same container, talks to it).
       ROVIK_PROXY_HOST: 0.0.0.0
       ROVIK_PROXY_PORT: "8788"
+      LAYA_SIDECAR_HOST: 127.0.0.1
+      LAYA_SIDECAR_PORT: "8777"
+      # Judge stays on container loopback — single-container default is correct.
+      # ROVIK_JUDGE_URL: http://127.0.0.1:8777/predict   (default, do not set)
       # ---- routing targets (override every one for your machine) ----
-      ROVIK_LOCAL_URL: http://host.docker.internal:8081/v1/chat/completions
-      ROVIK_LOCAL_MODEL: local-8b
-      # frontier escalation + thresholds + tags live in your private env file:
-      ROVIK_ESC_URL: https://openrouter.ai/api/v1/chat/completions
-      ROVIK_ESC_MODEL: z-ai/glm-5.3
-      ROVIK_ESC_KEYNAME: OPENROUTER_API_KEY
-      ROVIK_FALLBACK_ROUTE: local          # Laya/local failure never spends money
-      LAYA_THRESH_HARD: "0.6"              # small local model => escalate sooner
-      LAYA_THRESH_TOOLS: "0.5"
-      LAYA_THRESH_VERIFY: "0.5"
-      ROVIK_JUDGE_URL: http://rovik-sidecar:8777/predict
-      ROVIK_LOG_DIR: /tmp/rovik
-    extra_hosts:
-      - "host.docker.internal:host-gateway"   # Linux; Docker Desktop defines it natively
-    # env_file:
-    #   - ./rovik.env                        # or keep everything explicit above
+      # Local LLM as a sibling container on the shared network (Ollama),
+      # or host.docker.internal if it runs on the host:
+      ROVIK_LOCAL_URL: ${ROVIK_LOCAL_URL:-http://ollama:11434/v1/chat/completions}
+      ROVIK_LOCAL_MODEL: ${ROVIK_LOCAL_MODEL:-qwen2.5:7b}
+      ROVIK_ESC_URL: ${ROVIK_ESC_URL:-https://openrouter.ai/api/v1/chat/completions}
+      ROVIK_ESC_MODEL: ${ROVIK_ESC_MODEL:-z-ai/glm-5.3}
+      ROVIK_ESC_KEYNAME: ${ROVIK_ESC_KEYNAME:-OPENROUTER_API_KEY}
+      # Laya/local failures never touch the paid tier.
+      ROVIK_FALLBACK_ROUTE: local
+      # Small local model => lower the escalation cutoff (README: 0.5-0.6).
+      LAYA_THRESH_HARD: ${LAYA_THRESH_HARD:-0.55}
+      LAYA_THRESH_TOOLS: ${LAYA_THRESH_TOOLS:-0.5}
+      LAYA_THRESH_VERIFY: ${LAYA_THRESH_VERIFY:-0.5}
+      # First boot trains the synthetic toy checkpoint here if empty.
+      LAYA_MODEL_PATH: /app/checkpoints/cold-test
+      ROVIK_LOG_DIR: /app/data
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-4}
+    ports:
+      - "${ROVIK_PORT:-8788}:8788"
+    volumes:
+      - rovik-data:/app/data
+      - rovik-checkpoints:/app/checkpoints
+    networks:
+      rovik-net:
+        aliases:
+          - rovik
+    # Joins an existing network so sibling containers (Ollama, agent
+    # harnesses) reach Rovik by name. Override with ROVIK_NETWORK.
+
+networks:
+  rovik-net:
+    name: ${ROVIK_NETWORK:-ai-stack_default}
+    external: true
+
+volumes:
+  rovik-data:
+  rovik-checkpoints:
